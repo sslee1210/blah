@@ -3,6 +3,7 @@ from __future__ import annotations
 """Small, rate-limited Kiwoom REST client for US stock market data."""
 
 import math
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -21,6 +22,9 @@ US_EASTERN = ZoneInfo("America/New_York")
 KOREA = ZoneInfo("Asia/Seoul")
 EXCHANGE_NAMES = {"ND": "NASDAQ", "NY": "NYSE", "NA": "AMEX"}
 EXCHANGE_RANK_CODES = {"NY": "1", "ND": "2", "NA": "3"}
+REGULAR_SESSION_CLOSE_MINUTE = 16 * 60
+MAX_DAILY_SESSION_LAG_DAYS = 4
+MAX_MINUTE_DATA_AGE_DAYS = 7
 
 
 class KiwoomRestError(RuntimeError):
@@ -297,25 +301,28 @@ class KiwoomRestClient:
             max_pages=max_pages,
             page_delay=12.1,
         )
-        result: list[StockInfo] = []
+        result: dict[tuple[str, str], StockInfo] = {}
         for row in rows:
             symbol = str(row.get("stk_cd", "")).strip().upper()
             stex = str(row.get("stex_tp", "")).strip().upper()
             if not symbol or stex not in EXCHANGE_NAMES:
                 continue
-            result.append(
-                StockInfo(
-                    symbol=symbol,
-                    exchange=stex,
-                    korean_name=str(row.get("stk_nm", "")).strip(),
-                    english_name=str(row.get("stk_enm", "")).strip(),
-                    sector=str(row.get("upgb", "")).strip() or "미분류",
-                    is_etf=str(row.get("isEtf", "N")).strip().upper() == "Y",
-                )
+            result[(stex, symbol)] = StockInfo(
+                symbol=symbol,
+                exchange=stex,
+                korean_name=str(row.get("stk_nm", "")).strip(),
+                english_name=str(row.get("stk_enm", "")).strip(),
+                sector=str(row.get("upgb", "")).strip() or "미분류",
+                is_etf=str(row.get("isEtf", "N")).strip().upper() == "Y",
             )
-        return result
+        return list(result.values())
 
-    def stock_info(self, symbol: str, exchange: str = "") -> StockInfo:
+    def stock_info(self, symbol: str, exchange: str) -> StockInfo:
+        exchange = exchange.strip().upper()
+        if exchange not in EXCHANGE_NAMES:
+            raise InvalidSecurityError(
+                f"{symbol} 종목 조회에는 ND·NY·NA 중 하나의 거래소 코드가 필요합니다."
+            )
         payload, _ = self.request(
             "usa10100",
             "/api/us/stkinfo",
@@ -365,14 +372,16 @@ class KiwoomRestClient:
         calendar_days: int = 1200,
         max_rows: int = 650,
     ) -> pd.DataFrame:
-        start = (date.today() - timedelta(days=max(180, calendar_days))).strftime("%Y%m%d")
+        now = datetime.now(US_EASTERN)
         rows = self.paged(
             "usa06012",
             "/api/us/chart",
             {
                 "stex_tp": stock.exchange,
                 "stk_cd": stock.symbol,
-                "strt_dt": start,
+                # usa06012 returns bars backwards from this anchor date.  A
+                # past lower-bound here silently makes the whole result old.
+                "strt_dt": now.strftime("%Y%m%d"),
                 "upd_stkpc_tp": "1",
                 "exrt_appl_tp": "0",
             },
@@ -381,9 +390,18 @@ class KiwoomRestClient:
             max_rows=max_rows,
         )
         frame = _daily_frame(rows)
+        cutoff = pd.Timestamp(now.date() - timedelta(days=max(180, calendar_days)))
+        frame = frame.loc[frame.index >= cutoff]
+        frame = completed_daily_bars(frame, now=now)
         if len(frame) < 80:
             raise KiwoomRestError(
                 f"{stock.symbol} 일봉이 {len(frame)}개뿐이라 일목 분석에 부족합니다(최소 80개)."
+            )
+        if not daily_frame_is_current(frame, now=now):
+            latest = pd.Timestamp(frame.index[-1]).date().isoformat()
+            raise KiwoomRestError(
+                f"{stock.symbol} 일봉의 마지막 날짜가 {latest}로 오래되었습니다. "
+                "최신 데이터가 아니므로 분석을 중단합니다."
             )
         return frame.tail(max_rows)
 
@@ -395,14 +413,14 @@ class KiwoomRestClient:
         calendar_days: int = 120,
         max_rows: int = 500,
     ) -> pd.DataFrame:
-        start = (date.today() - timedelta(days=max(10, calendar_days))).strftime("%Y%m%d")
+        now = datetime.now(US_EASTERN)
         rows = self.paged(
             "usa06011",
             "/api/us/chart",
             {
                 "stex_tp": stock.exchange,
                 "stk_cd": stock.symbol,
-                "strt_dt": start,
+                "strt_dt": now.strftime("%Y%m%d"),
                 "tic_scope": str(interval_minutes),
                 "upd_stkpc_tp": "1",
                 "exrt_appl_tp": "0",
@@ -411,7 +429,16 @@ class KiwoomRestClient:
             max_pages=12,
             max_rows=max_rows,
         )
-        return _minute_frame(rows).tail(max_rows)
+        frame = _minute_frame(rows)
+        cutoff = pd.Timestamp(now - timedelta(days=max(10, calendar_days)))
+        frame = frame.loc[frame.index >= cutoff]
+        if not frame.empty and not minute_frame_is_current(frame, now=now):
+            latest = pd.Timestamp(frame.index[-1]).isoformat()
+            raise KiwoomRestError(
+                f"{stock.symbol} {interval_minutes}분봉의 마지막 시각이 {latest}로 오래되었습니다. "
+                "최신 데이터가 아니므로 분석을 중단합니다."
+            )
+        return frame.tail(max_rows)
 
     def ranking(self, api_id: str, *, max_rows: int = 250) -> list[dict[str, Any]]:
         body: dict[str, str] = {
@@ -464,14 +491,76 @@ def _daily_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
     return frame.astype(float)
 
 
+def latest_completed_us_weekday(now: datetime | None = None) -> date:
+    """Return the latest date whose US regular session can be complete.
+
+    The API does not expose a trading-calendar endpoint.  Weekends are handled
+    exactly; the recency check below permits a small calendar-day lag so US
+    exchange holidays do not make a valid previous close unusable.
+    """
+
+    local = _eastern_datetime(now)
+    session_date = local.date()
+    if local.weekday() < 5 and local.hour * 60 + local.minute < REGULAR_SESSION_CLOSE_MINUTE:
+        session_date -= timedelta(days=1)
+    while session_date.weekday() >= 5:
+        session_date -= timedelta(days=1)
+    return session_date
+
+
+def completed_daily_bars(
+    frame: pd.DataFrame, *, now: datetime | None = None
+) -> pd.DataFrame:
+    """Remove today's still-forming daily bar before any close-based analysis."""
+
+    if frame.empty:
+        return frame.copy()
+    completed_through = latest_completed_us_weekday(now)
+    dates = pd.DatetimeIndex(frame.index).date
+    return frame.loc[dates <= completed_through].copy()
+
+
+def daily_frame_is_current(
+    frame: pd.DataFrame, *, now: datetime | None = None
+) -> bool:
+    """Reject caches/API responses that are fresh on disk but stale in market time."""
+
+    if frame.empty:
+        return False
+    latest = pd.Timestamp(frame.index[-1]).date()
+    local = _eastern_datetime(now)
+    expected = latest_completed_us_weekday(local)
+    if latest > local.date():
+        return False
+    return latest >= expected - timedelta(days=MAX_DAILY_SESSION_LAG_DAYS)
+
+
+def minute_frame_is_current(
+    frame: pd.DataFrame, *, now: datetime | None = None
+) -> bool:
+    if frame.empty:
+        return False
+    local = _eastern_datetime(now)
+    latest = pd.Timestamp(frame.index[-1])
+    if latest.tzinfo is None:
+        latest = latest.tz_localize(US_EASTERN)
+    else:
+        latest = latest.tz_convert(US_EASTERN)
+    return local - timedelta(days=MAX_MINUTE_DATA_AGE_DAYS) <= latest <= local + timedelta(hours=1)
+
+
+def _eastern_datetime(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.now(US_EASTERN)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=US_EASTERN)
+    return value.astimezone(US_EASTERN)
+
+
 def _minute_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     for row in rows:
-        timestamp = pd.to_datetime(
-            str(row.get("cntr_tm", "")), format="%Y%m%d%H%M%S", errors="coerce"
-        )
-        if pd.notna(timestamp):
-            timestamp = timestamp.tz_localize(US_EASTERN, nonexistent="shift_forward", ambiguous="NaT")
+        timestamp = _parse_us_chart_time(row.get("cntr_tm"), row.get("bus_dt"))
         values = {
             "timestamp": timestamp,
             "open": number(row.get("open_pric"), absolute=True),
@@ -488,3 +577,39 @@ def _minute_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
     frame = frame.sort_values("timestamp").set_index("timestamp")
     frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0)
     return frame.astype(float)
+
+
+def _parse_us_chart_time(value: Any, business_date: Any = None) -> pd.Timestamp:
+    """Parse Kiwoom's US-session clock, including 24:00-27:00 overnight bars."""
+
+    text = re.sub(r"\D", "", str(value or ""))
+    if len(text) < 14:
+        return pd.NaT
+    date_text = text[:8]
+    if not date_text.isdigit():
+        date_text = re.sub(r"\D", "", str(business_date or ""))[:8]
+    base = pd.to_datetime(date_text, format="%Y%m%d", errors="coerce")
+    try:
+        hour, minute, second = int(text[8:10]), int(text[10:12]), int(text[12:14])
+    except ValueError:
+        return pd.NaT
+    if pd.isna(base) or hour > 47 or minute > 59 or second > 59:
+        return pd.NaT
+    naive = base + pd.Timedelta(hours=hour, minutes=minute, seconds=second)
+    return naive.tz_localize(US_EASTERN, nonexistent="shift_forward", ambiguous="NaT")
+
+
+def regular_session_minute_bars(frame: pd.DataFrame) -> pd.DataFrame:
+    """Keep only Kiwoom's hourly buckets that overlap the US regular session."""
+
+    if frame.empty:
+        return frame.copy()
+    index = pd.DatetimeIndex(frame.index)
+    if index.tz is None:
+        index = index.tz_localize(US_EASTERN)
+    else:
+        index = index.tz_convert(US_EASTERN)
+    minutes = index.hour * 60 + index.minute
+    # Kiwoom labels the opening partial bucket 09:00 and the closing bucket
+    # 16:00.  Overnight/extended buckets (04-08, 17-27) are excluded.
+    return frame.loc[(minutes >= 9 * 60) & (minutes <= 16 * 60)].copy()

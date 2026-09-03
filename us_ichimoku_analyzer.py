@@ -28,6 +28,7 @@ from core.kiwoom_rest import (
     KiwoomRestError,
     Quote,
     StockInfo,
+    regular_session_minute_bars,
 )
 from core.reporting import (
     AnalyzedStock,
@@ -83,11 +84,22 @@ class USStockAnalyzer:
     def resolve_stock(self, text: str) -> StockInfo:
         query = _command_query(text)
         normalized = query.strip().upper()
-        if SYMBOL_RE.fullmatch(normalized):
-            stock = self.client.stock_info(normalized)
-            self._validate_stock(stock)
-            return stock
         master = self.master()
+        if SYMBOL_RE.fullmatch(normalized):
+            matches = _unique_stocks(
+                stock for stock in master if stock.symbol.upper() == normalized
+            )
+            matches = [stock for stock in matches if is_supported_common_stock(stock)]
+            if not matches:
+                raise InvalidSecurityError(
+                    f"'{normalized}'에 해당하는 미국 일반주를 종목 목록에서 찾지 못했습니다."
+                )
+            if len(matches) > 1:
+                exchanges = ", ".join(stock.exchange for stock in matches)
+                raise InvalidSecurityError(
+                    f"{normalized}이 여러 거래소에 있어 하나로 확정할 수 없습니다: {exchanges}"
+                )
+            return matches[0]
         exact = [
             stock
             for stock in master
@@ -104,7 +116,7 @@ class USStockAnalyzer:
             if query.casefold() in stock.korean_name.casefold()
             or query.casefold() in stock.english_name.casefold()
         ]
-        choices = exact or partial
+        choices = _unique_stocks(exact or partial)
         choices = [stock for stock in choices if is_supported_common_stock(stock)]
         if not choices:
             raise InvalidSecurityError(f"'{query}'에 해당하는 미국 일반주를 찾지 못했습니다.")
@@ -115,7 +127,7 @@ class USStockAnalyzer:
 
     def market_context(self) -> tuple[str, bool]:
         defaults = {
-            "SPY": StockInfo("SPY", "NA", "S&P 500 시장", "SPDR S&P 500 ETF", "시장", True),
+            "SPY": StockInfo("SPY", "NY", "S&P 500 시장", "SPDR S&P 500 ETF", "시장", True),
             "QQQ": StockInfo("QQQ", "ND", "나스닥 100 시장", "Invesco QQQ", "시장", True),
         }
         known = self._master or self.cache.load_master() or []
@@ -125,7 +137,7 @@ class USStockAnalyzer:
             stock = known_by_symbol.get(symbol)
             if stock is None:
                 try:
-                    stock = self.client.stock_info(symbol)
+                    stock = self.client.stock_info(symbol, default.exchange)
                 except Exception:
                     stock = default
             proxies.append(stock)
@@ -134,11 +146,7 @@ class USStockAnalyzer:
         for stock in proxies:
             try:
                 frame = self._daily(stock, full_history=False)
-                readings.append(
-                    analyze_ichimoku(
-                        _volume_pace_adjusted(frame), timeframe=f"{stock.symbol} 일봉"
-                    )
-                )
+                readings.append(analyze_ichimoku(frame, timeframe=f"{stock.symbol} 일봉"))
             except Exception as exc:
                 failures.append(f"{stock.symbol}: {_short_error(exc)}")
         if len(readings) < 2:
@@ -291,9 +299,9 @@ class USStockAnalyzer:
         quote: Quote | None = None
         if include_quote:
             quote = self.client.quote(stock)
-            daily_frame = _merge_live_regular_session(daily_frame, quote)
-            self.cache.save_daily(stock, daily_frame)
-        analysis_frame = _volume_pace_adjusted(daily_frame)
+        # The quote is displayed as live context only.  It must never replace
+        # the latest completed daily close used by Ichimoku and similarity.
+        analysis_frame = daily_frame
         daily = analyze_ichimoku(analysis_frame, timeframe="일봉")
         weekly: IchimokuReading | None = None
         try:
@@ -345,20 +353,24 @@ class USStockAnalyzer:
             calendar_days=1500 if full_history else 1000,
             max_rows=650 if full_history else 460,
         )
-        old = self.cache.load_daily(stock)
-        if old is not None and not old.empty:
-            frame = pd.concat([old, frame]).sort_index()
-            frame = frame[~frame.index.duplicated(keep="last")].tail(650)
+        # The endpoint already returns a complete recent window.  Merging an
+        # obsolete cache can create a multi-year hole that looks contiguous to
+        # indicator and forward-return calculations.
         self.cache.save_daily(stock, frame)
         return frame
 
     def _minute(self, stock: StockInfo, *, interval: int) -> pd.DataFrame:
         cached = self.cache.load_minute(stock, interval, fresh_only=True)
-        if cached is not None and len(cached) >= 100:
-            return cached
+        if cached is not None:
+            cached = regular_session_minute_bars(cached)
+            if len(cached) >= 80:
+                return cached
         frame = self.client.minute_bars(stock, interval_minutes=interval, max_rows=500)
+        frame = regular_session_minute_bars(frame)
         if len(frame) < 80:
-            raise KiwoomRestError(f"{stock.symbol} {interval}분봉 데이터가 부족합니다.")
+            raise KiwoomRestError(
+                f"{stock.symbol} 정규장 {interval}분봉 데이터가 {len(frame)}개뿐이라 부족합니다."
+            )
         self.cache.save_minute(stock, interval, frame)
         return frame
 
@@ -387,57 +399,11 @@ def _liquidity(reading: IchimokuReading) -> tuple[bool, str]:
     return True, ""
 
 
-def _merge_live_regular_session(frame: pd.DataFrame, quote: Quote) -> pd.DataFrame:
-    now = quote.timestamp.astimezone(US_EASTERN)
-    minute = now.hour * 60 + now.minute
-    if now.weekday() >= 5 or not (570 <= minute <= 975):
-        return frame
-    output = frame.copy()
-    day = pd.Timestamp(now.date())
-    prior_close = float(output["close"].iloc[-1])
-    open_price = quote.open or quote.price or prior_close
-    high_price = max(value for value in (quote.high, quote.price, open_price) if value is not None)
-    low_price = min(value for value in (quote.low, quote.price, open_price) if value is not None)
-    row = {
-        "open": open_price,
-        "high": high_price,
-        "low": low_price,
-        "close": quote.price,
-        "volume": quote.volume or 0.0,
-        "trade_value": (quote.volume or 0.0) * quote.price,
-    }
-    output.loc[day, list(row)] = list(row.values())
-    return output.sort_index()
-
-
-def _volume_pace_adjusted(frame: pd.DataFrame) -> pd.DataFrame:
-    """Estimate full-session volume only for an in-progress regular-session bar.
-
-    This prevents a 10 a.m. candle from being called a low-volume breakout just
-    because most of the trading day has not happened yet.  Raw values remain in
-    the on-disk cache; only the analysis copy is adjusted.
-    """
-
-    if frame.empty:
-        return frame
-    now = datetime.now(US_EASTERN)
-    minutes = now.hour * 60 + now.minute
-    if now.weekday() >= 5 or not (570 <= minutes < 960):
-        return frame
-    try:
-        latest_day = pd.Timestamp(frame.index[-1]).date()
-    except Exception:
-        return frame
-    if latest_day != now.date():
-        return frame
-    fraction = max(0.08, min(1.0, (minutes - 570) / 390.0))
-    output = frame.copy()
-    output.iloc[-1, output.columns.get_loc("volume")] = float(output["volume"].iloc[-1]) / fraction
-    if "trade_value" in output.columns:
-        output.iloc[-1, output.columns.get_loc("trade_value")] = (
-            float(output["trade_value"].iloc[-1]) / fraction
-        )
-    return output
+def _unique_stocks(stocks: Iterator[StockInfo] | list[StockInfo]) -> list[StockInfo]:
+    unique: dict[tuple[str, str], StockInfo] = {}
+    for stock in stocks:
+        unique[(stock.exchange, stock.symbol)] = stock
+    return list(unique.values())
 
 
 def _command_query(text: str) -> str:

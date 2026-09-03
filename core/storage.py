@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from .kiwoom_rest import StockInfo
+from .kiwoom_rest import StockInfo, daily_frame_is_current, minute_frame_is_current
 
 
 US_EASTERN = ZoneInfo("America/New_York")
@@ -42,7 +42,10 @@ class CacheStore:
         path = self.daily_path(stock)
         if not path.exists() or (fresh_only and not self._fresh(path, intraday=False)):
             return None
-        return self._read_frame(path)
+        frame = self._read_frame(path)
+        if fresh_only and (frame is None or not daily_frame_is_current(frame)):
+            return None
+        return frame
 
     def save_daily(self, stock: StockInfo, frame: pd.DataFrame) -> None:
         self._write_frame(self.daily_path(stock), frame)
@@ -53,7 +56,10 @@ class CacheStore:
         path = self.minute_path(stock, interval)
         if not path.exists() or (fresh_only and not self._fresh(path, intraday=True)):
             return None
-        return self._read_frame(path)
+        frame = self._read_frame(path)
+        if fresh_only and (frame is None or not minute_frame_is_current(frame)):
+            return None
+        return frame
 
     def save_minute(self, stock: StockInfo, interval: int, frame: pd.DataFrame) -> None:
         self._write_frame(self.minute_path(stock, interval), frame)
@@ -85,7 +91,7 @@ class CacheStore:
         now = datetime.now(US_EASTERN)
         weekday = now.weekday() < 5
         minutes = now.hour * 60 + now.minute
-        regular_session = weekday and 570 <= minutes <= 975
+        regular_session = weekday and 570 <= minutes < 960
         if intraday:
             maximum_age = timedelta(minutes=10 if regular_session else 90)
         else:
@@ -128,4 +134,3 @@ class CacheStore:
         finally:
             if temp.exists():
                 temp.unlink()
-

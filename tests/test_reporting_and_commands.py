@@ -10,7 +10,7 @@ from core.similarity import SimilarityResult
 from tests.test_ichimoku import make_frame
 from core.ichimoku import analyze_ichimoku
 from core.kiwoom_rest import StockInfo
-from us_ichimoku_analyzer import _command_query, _liquidity
+from us_ichimoku_analyzer import USStockAnalyzer, _command_query, _liquidity
 
 
 def test_command_query_accepts_ticker_and_korean_name() -> None:
@@ -81,3 +81,18 @@ def test_liquidity_blocks_small_dollar_volume() -> None:
     liquid, reason = _liquidity(reading)
     assert not liquid
     assert "거래대금" in reason
+
+
+def test_direct_ticker_resolution_uses_master_exchange_without_blank_api_call() -> None:
+    stock = StockInfo("AAPL", "ND", "애플", "APPLE INC", "기술", False)
+
+    class FakeClient:
+        def stock_info(self, *args, **kwargs):
+            pytest.fail("direct stock_info call should not be needed")
+
+    class FakeCache:
+        def load_master(self):
+            return [stock, stock]
+
+    analyzer = USStockAnalyzer(FakeClient(), FakeCache())
+    assert analyzer.resolve_stock("AAPL 분석해줘") == stock
