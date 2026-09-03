@@ -1,0 +1,8 @@
+.runtime/
+.us_ichimoku_cache/
+reports/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+
