@@ -13,7 +13,15 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from .kiwoom_rest import StockInfo, daily_frame_is_current, minute_frame_is_current
+from .ichimoku import prepare_ohlcv
+from .kiwoom_rest import (
+    REGULAR_SESSION_CLOSE_MINUTE,
+    StockInfo,
+    completed_daily_bars,
+    daily_frame_is_current,
+    latest_completed_us_weekday,
+    minute_frame_is_current,
+)
 
 
 US_EASTERN = ZoneInfo("America/New_York")
@@ -43,6 +51,8 @@ class CacheStore:
         if not path.exists() or (fresh_only and not self._fresh(path, intraday=False)):
             return None
         frame = self._read_frame(path)
+        if frame is not None:
+            frame = completed_daily_bars(frame)
         if fresh_only and (frame is None or not daily_frame_is_current(frame)):
             return None
         return frame
@@ -56,7 +66,7 @@ class CacheStore:
         path = self.minute_path(stock, interval)
         if not path.exists() or (fresh_only and not self._fresh(path, intraday=True)):
             return None
-        frame = self._read_frame(path)
+        frame = self._read_frame(path, intraday=True)
         if fresh_only and (frame is None or not minute_frame_is_current(frame)):
             return None
         return frame
@@ -64,13 +74,14 @@ class CacheStore:
     def save_minute(self, stock: StockInfo, interval: int, frame: pd.DataFrame) -> None:
         self._write_frame(self.minute_path(stock, interval), frame)
 
-    def load_master(self, *, max_age_hours: int = 24) -> list[StockInfo] | None:
+    def load_master(self, *, max_age_hours: int | None = 24) -> list[StockInfo] | None:
         path = self.root / "us_stock_master.json"
         if not path.exists():
             return None
-        age = datetime.now().timestamp() - path.stat().st_mtime
-        if age > max_age_hours * 3600:
-            return None
+        if max_age_hours is not None:
+            age = datetime.now().timestamp() - path.stat().st_mtime
+            if age > max_age_hours * 3600:
+                return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             return [StockInfo(**item) for item in payload if isinstance(item, dict)]
@@ -96,15 +107,39 @@ class CacheStore:
             maximum_age = timedelta(minutes=10 if regular_session else 90)
         else:
             maximum_age = timedelta(minutes=15 if regular_session else 12 * 60)
-        return now - modified <= maximum_age
+            # An intraday cache contains the previous close. Its age alone
+            # cannot make it reusable after another regular session ends.
+            completed_date = latest_completed_us_weekday(now)
+            completed_at = datetime.combine(completed_date, datetime.min.time(), tzinfo=US_EASTERN)
+            completed_at += timedelta(minutes=REGULAR_SESSION_CLOSE_MINUTE)
+            if modified < completed_at:
+                return False
+        return timedelta(0) <= now - modified <= maximum_age
 
     @staticmethod
-    def _read_frame(path: Path) -> pd.DataFrame | None:
+    def _read_frame(path: Path, *, intraday: bool = False) -> pd.DataFrame | None:
         try:
-            frame = pd.read_csv(path, index_col="timestamp", parse_dates=["timestamp"])
+            frame = pd.read_csv(path, index_col="timestamp")
+            if not {"open", "high", "low", "close", "volume"}.issubset(frame.columns):
+                return None
+            if intraday:
+                # A US history can contain both -04:00 and -05:00 offsets.
+                # Parsing directly creates an object index across DST.
+                stamps = [pd.Timestamp(value) for value in frame.index]
+                if any(pd.isna(stamp) for stamp in stamps):
+                    return None
+                localized = [
+                    stamp.tz_localize(US_EASTERN) if stamp.tzinfo is None else stamp
+                    for stamp in stamps
+                ]
+                frame.index = pd.to_datetime(localized, utc=True).tz_convert(US_EASTERN)
+            else:
+                frame.index = pd.to_datetime(frame.index, errors="raise")
+            if frame.index.hasnans or not frame.index.is_unique:
+                return None
             frame.index.name = "timestamp"
-            return frame.sort_index()
-        except (OSError, ValueError, pd.errors.ParserError):
+            return prepare_ohlcv(frame)
+        except (OSError, TypeError, ValueError, pd.errors.ParserError):
             return None
 
     @staticmethod

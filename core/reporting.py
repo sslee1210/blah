@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
+from math import isfinite
 import re
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 from .ichimoku import IchimokuReading
 from .kiwoom_rest import Quote, StockInfo
@@ -24,10 +26,16 @@ class AnalyzedStock:
     liquidity_reason: str = ""
 
 
-def render_html_report(markdown: str, *, title: str) -> str:
+def render_html_report(
+    markdown: str,
+    *,
+    title: str,
+    footer: str = "Real2 · 키움 REST API 미국주식 · 일목 9·26·52",
+) -> str:
     """Turn the analyzer's limited Markdown into a standalone, safe HTML report."""
     body = _markdown_blocks(markdown)
     safe_title = escape(title)
+    safe_footer = escape(footer)
     return f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -90,7 +98,7 @@ def render_html_report(markdown: str, *, title: str) -> str:
 <div class="top"></div>
 <main>
 {body}
-<div class="footer">Real2 · 키움 REST API 미국주식 · 일목 9·26·52</div>
+<div class="footer">{safe_footer}</div>
 </main>
 </body>
 </html>
@@ -98,7 +106,7 @@ def render_html_report(markdown: str, *, title: str) -> str:
 
 
 def usd(value: float | None) -> str:
-    if value is None:
+    if value is None or not isfinite(value):
         return "확인 불가"
     if abs(value) >= 100:
         return f"${value:,.2f}"
@@ -108,7 +116,7 @@ def usd(value: float | None) -> str:
 
 
 def compact_money(value: float | None) -> str:
-    if value is None:
+    if value is None or not isfinite(value):
         return "확인 불가"
     if value >= 1_000_000_000:
         return f"${value / 1_000_000_000:.1f}B"
@@ -124,7 +132,12 @@ def render_individual_report(result: AnalyzedStock) -> str:
     daily = result.daily
     quote = result.quote
     live_price = quote.price if quote is not None else daily.close
-    live_time = quote.timestamp.strftime("%Y-%m-%d %H:%M %Z") if quote is not None else daily.data_timestamp
+    price_label = "최근 조회 가격" if quote is not None else "분석 일봉 종가"
+    price_context = (
+        f"조회 시각 {quote.timestamp.astimezone(ZoneInfo('America/New_York')):%Y-%m-%d %H:%M:%S %Z}; 실제 체결 시각과 다를 수 있습니다."
+        if quote is not None
+        else f"{daily.data_timestamp} 완료 일봉 기준이며 현재가를 조회한 값이 아닙니다."
+    )
     reasons = list(daily.reasons[:3]) or ["아직 뚜렷한 상승 확인 신호가 없습니다."]
     blocks = list(daily.hard_blocks[:3])
     risks = list(daily.risks[:3])
@@ -138,14 +151,18 @@ def render_individual_report(result: AnalyzedStock) -> str:
     invalidation_text = (
         "일봉 종가가 이 아래로 내려가면 지금의 상승 시나리오는 폐기합니다."
     )
-    target_text = "도달 보장이 아닌 첫 저항 후보입니다. 이 부근에서는 일부 이익 보호를 검토합니다."
+    target_text = (
+        "도달 보장이 아닌 첫 저항 후보입니다."
+        if daily.first_target_price is not None
+        else "확인할 수 있는 상단 저항이 없어 목표 가격을 제시하지 않습니다."
+    )
     flat_text = ", ".join(usd(value) for value in daily.flat_span_b_levels) or "뚜렷한 수평 구간 없음"
     volume_level_text = ", ".join(usd(value) for value in daily.volume_profile_levels) or "뚜렷한 집중 구간 없음"
     lines = [
         f"# {stock.display_name} ({stock.symbol}) 미국주식 분석",
         "",
         f"> **지금 할 일: {daily.action}**",
-        f"> 일목 등급 {daily.grade} · 신뢰도 {daily.confidence} · 실시간/최근 가격 {usd(live_price)}",
+        f"> 일목 등급 {daily.grade} · 신뢰도 {daily.confidence} · {price_label} {usd(live_price)}",
         "",
         "## 왜 이렇게 봤나요?",
         "",
@@ -162,7 +179,8 @@ def render_individual_report(result: AnalyzedStock) -> str:
             "",
             "| 항목 | 가격 | 쉬운 뜻 |",
             "|---|---:|---|",
-            f"| 실시간/최근 가격 | {usd(live_price)} | {live_time} 키움 현재가입니다. |",
+            f"| {price_label} | {usd(live_price)} | {price_context} |",
+            f"| 분석 기준 종가 | {usd(daily.close)} | {daily.data_timestamp} 완료 일봉; 등급·손익비·가격 기준의 계산값입니다. |",
             f"| 확인할 가격 | {usd(daily.watch_price)} | {support_text} |",
             f"| 시나리오 무효 가격 | {usd(daily.invalidation_price)} | {invalidation_text} |",
             f"| 첫 저항·목표 후보 | {usd(daily.first_target_price)} | {target_text} |",
@@ -170,7 +188,10 @@ def render_individual_report(result: AnalyzedStock) -> str:
             "## 거래량·큰 흐름",
             "",
             f"- 거래량: {_volume_text(daily.volume_ratio)}",
-            "- 미국 정규장 진행 중이면 현재 거래 속도를 하루 기준으로 환산해 비교합니다.",
+            f"- 변동성: ATR(14) {daily.atr14_pct:.2f}% · 분석 완료 캔들 {daily.candle_range_atr:.2f} ATR",
+            f"- 추세 강도: ADX(14) {daily.adx14:.1f} · +DI {daily.plus_di14:.1f} / -DI {daily.minus_di14:.1f}",
+            f"- 첫 저항까지 손익비: {daily.reward_risk_ratio:.2f}:1 (실제 저항이 없으면 0으로 보수적 표시)",
+            "- 거래량·손익비는 분석 완료 일봉 기준이며 이후 현재가 변동을 반영하지 않습니다.",
             f"- 최근 20일 평균 거래대금: {compact_money(daily.avg_trade_value_20)}",
             f"- 주봉: {daily.higher_timeframe}",
             f"- 미국 시장: {daily.market_context}",
@@ -209,6 +230,7 @@ def render_individual_report(result: AnalyzedStock) -> str:
             f"- 데이터 범위: {daily.source_range}",
             "- 일목 파라미터: 9, 26, 52 (26기간 이동)",
             "- 가격 통화: USD",
+            "- 기준 시간대: America/New_York (미국 동부시간)",
             "- 데이터 출처: 키움 REST API 미국주식",
             "",
             "> 이 보고서는 조건부 차트 시나리오이며 투자 권유가 아닙니다.",
@@ -258,7 +280,8 @@ def render_scan_report(
             f"- 실제 분석 완료: {len(values):,}개",
             f"- 데이터 오류: {len(failures):,}개",
             f"- 소요 시간: {str(elapsed).split('.')[0]}",
-            f"- 시작/종료: {started_at:%Y-%m-%d %H:%M:%S} / {finished_at:%Y-%m-%d %H:%M:%S}",
+            f"- 시작/종료: {started_at.astimezone(ZoneInfo('America/New_York')):%Y-%m-%d %H:%M:%S %Z} / {finished_at.astimezone(ZoneInfo('America/New_York')):%Y-%m-%d %H:%M:%S %Z}",
+            "- 가격 통화/기준 시간대: USD / America/New_York (미국 동부시간)",
             "- 선별 방식: 시가총액 상위 + 거래대금 상위의 합집합을 업종별로 분산",
             "- 일목 파라미터: 9, 26, 52 / 일봉 주 분석 + 주봉 확인",
             "- 과거 지표 일치 표본: 일목 핵심 상태 모두 일치 후 RSI·SMA·모멘텀·거래량·캔들 폭도 항목별로 최대한 같은 과거 최대 30건",
@@ -301,19 +324,37 @@ def _is_interest(item: AnalyzedStock) -> bool:
     )
 
 
-def _sort_key(item: AnalyzedStock) -> tuple[int, int, float, float]:
+def _sort_key(item: AnalyzedStock) -> tuple[int, int, float, float, float, float, float]:
     grade_order = {"A+": 0, "A": 1, "B": 2, "C": 3, "D": 4}
     rate = item.similarity.up_rate if item.similarity.up_rate is not None else -1.0
+    expected = (
+        item.similarity.expected_return_pct
+        if item.similarity.expected_return_pct is not None and item.similarity.sample_count >= 15
+        else -999.0
+    )
+    invalidation = (
+        item.similarity.invalidation_rate
+        if item.similarity.invalidation_rate is not None
+        else 100.0
+    )
     value = item.daily.avg_trade_value_20 or 0.0
-    return (grade_order.get(item.daily.grade, 9), len(item.daily.hard_blocks), -rate, -value)
+    return (
+        grade_order.get(item.daily.grade, 9),
+        len(item.daily.hard_blocks),
+        -expected,
+        invalidation,
+        -item.daily.reward_risk_ratio,
+        -rate,
+        -value,
+    )
 
 
 def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> list[str]:
     if not items:
         return [empty]
     lines = [
-        "| 종목 | 등급 | 지금 할 일 | 확인/무효/목표 | 과거 지표 일치 10일 | 평균 거래대금 |",
-        "|---|:---:|---|---|---|---:|",
+        "| 종목 | 등급 | 지금 할 일 | 손익비/ADX | 확인/무효/목표 | 과거 지표 일치 10일 | 평균 거래대금 | 분석 일봉 종가 · 데이터 범위 |",
+        "|---|:---:|---|---|---|---|---:|---|",
     ]
     for item in items[:limit]:
         daily = item.daily
@@ -331,10 +372,13 @@ def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> l
         if not item.liquid:
             action = f"유동성 부족: {item.liquidity_reason}"
         levels = f"{usd(daily.watch_price)} / {usd(daily.invalidation_price)} / {usd(daily.first_target_price)}"
-        lines.append(
-            f"| {item.stock.display_name} ({item.stock.symbol}) | {daily.grade} | {action} | "
-            f"{levels} | {past} | {compact_money(daily.avg_trade_value_20)} |"
+        quality = f"{daily.reward_risk_ratio:.2f}:1 / {daily.adx14:.1f}"
+        cells = (
+            f"{item.stock.display_name} ({item.stock.symbol})", daily.grade, action,
+            quality, levels, past, compact_money(daily.avg_trade_value_20),
+            f"{usd(daily.close)} · {daily.source_range}",
         )
+        lines.append("| " + " | ".join(_table_cell(cell) for cell in cells) + " |")
     if len(items) > limit:
         lines.append(f"\n표가 길어 나머지 {len(items) - limit}개는 생략했습니다.")
     return lines
@@ -342,7 +386,7 @@ def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> l
 
 def _similarity_text(result: SimilarityResult) -> str:
     if result.up_rate is None:
-        return "현재 일목 핵심 상태가 모두 같은 과거 사례가 없습니다."
+        return f"과거 표본 내 결과: {result.sample_count}건 · {result.status}"
     recent = (
         f" 최근 표본은 {result.recent_up_count}/{result.recent_sample_count}건 상승"
         if result.recent_sample_count
@@ -364,12 +408,32 @@ def _similarity_text(result: SimilarityResult) -> str:
         if result.invalidation_rate is not None
         else "구조 지지선 이탈 확인 불가"
     )
+    expected = (
+        f"과거 표본 평균 수익률 {result.expected_return_pct:+.2f}%"
+        if result.expected_return_pct is not None
+        else "과거 표본 평균 수익률 확인 불가"
+    )
+    downside = (
+        f", 하위 25% 수익률 {result.downside_p25_pct:+.2f}%"
+        if result.downside_p25_pct is not None
+        else ""
+    )
+    payoff = (
+        f", 상승/하락 손익비 {result.payoff_ratio:.2f}"
+        if result.payoff_ratio is not None
+        else ""
+    )
+    median = (
+        f"{result.median_return_pct:+.2f}%"
+        if result.median_return_pct is not None
+        else "확인 불가"
+    )
     return (
         f"표본 조건: {result.match_level} · 조건 통과 과거 {result.candidate_count}건 중 "
         f"각 보조지표까지 최대한 같은 {result.sample_count}건을 사용했습니다. "
-        f"지표 일치 과거 {result.sample_count}건 중 {result.up_count}건 상승({result.up_rate:.1f}%), "
-        f"중간 수익률 {result.median_return_pct:+.2f}%, {average_up}, {average_down}, "
-        f"{invalidation}.{recent} · {result.status}"
+        f"과거 표본 내 결과: {result.sample_count}건 중 {result.up_count}건 상승({result.up_rate:.1f}%), "
+        f"중간 수익률 {median}, {average_up}, {average_down}, "
+        f"{expected}{downside}{payoff}, {invalidation}.{recent} · {result.status}"
     )
 
 
@@ -397,6 +461,11 @@ def _inline_markdown(text: str) -> str:
     safe = re.sub(r"`([^`]+)`", r"<code>\1</code>", safe)
     safe = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", safe)
     return safe
+
+
+def _table_cell(text: object) -> str:
+    """Keep provider text inside a single Markdown table cell."""
+    return " ".join(str(text).replace("|", "｜").split())
 
 
 def _is_table_separator(line: str) -> bool:

@@ -41,6 +41,12 @@ class IchimokuReading:
     avg_volume_20: float | None
     avg_trade_value_20: float | None
     candle_range_pct: float
+    atr14: float
+    atr14_pct: float
+    candle_range_atr: float
+    adx14: float
+    plus_di14: float
+    minus_di14: float
     flat_span_b_levels: tuple[float, ...]
     volume_profile_levels: tuple[float, ...]
     grade: str
@@ -53,7 +59,8 @@ class IchimokuReading:
     risks: tuple[str, ...]
     watch_price: float
     invalidation_price: float
-    first_target_price: float
+    first_target_price: float | None
+    reward_risk_ratio: float
     action: str
     higher_timeframe: str = "확인 전"
     market_context: str = "확인 전"
@@ -65,16 +72,30 @@ def prepare_ohlcv(frame: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"OHLCV 열이 없습니다: {', '.join(missing)}")
     result = frame.copy()
+    if not isinstance(result.index, pd.DatetimeIndex) or result.index.hasnans:
+        raise ValueError("OHLCV 날짜 인덱스가 올바르지 않습니다.")
     for column in required:
         result[column] = pd.to_numeric(result[column], errors="coerce")
+    prices = result[["open", "high", "low", "close"]]
+    valid_prices = np.isfinite(prices).all(axis=1) & (prices > 0).all(axis=1)
+    valid_prices &= result["high"] >= prices.max(axis=1)
+    valid_prices &= result["low"] <= prices.min(axis=1)
+    if not valid_prices.all():
+        raise ValueError("OHLC 가격이 유효하지 않거나 고가·저가 범위를 벗어났습니다.")
+    # Missing volume remains unknown; negative/infinite values are corrupt
+    # data, not a quiet trading session. Do not remove rows and change what a
+    # 26-period displacement or a 10-session research outcome means.
+    volume = result["volume"]
+    if ((volume < 0) | np.isinf(volume)).any():
+        raise ValueError("거래량에 음수 또는 무한대가 포함되어 있습니다.")
     if "trade_value" not in result:
         result["trade_value"] = result["close"] * result["volume"]
     else:
         result["trade_value"] = pd.to_numeric(result["trade_value"], errors="coerce")
+        if ((result["trade_value"] < 0) | np.isinf(result["trade_value"])).any():
+            raise ValueError("거래대금에 음수 또는 무한대가 포함되어 있습니다.")
         result["trade_value"] = result["trade_value"].fillna(result["close"] * result["volume"])
     result = result.replace([np.inf, -np.inf], np.nan)
-    result = result.dropna(subset=["open", "high", "low", "close"])
-    result = result[(result[["open", "high", "low", "close"]] > 0).all(axis=1)]
     result = result[~result.index.duplicated(keep="last")].sort_index()
     if len(result) < MIN_BARS:
         raise ValueError(f"일목 분석에는 최소 {MIN_BARS}개 캔들이 필요합니다.")
@@ -100,6 +121,32 @@ def calculate_ichimoku(frame: pd.DataFrame) -> pd.DataFrame:
     result["volume_avg20_prior"] = result["volume"].shift(1).rolling(20, min_periods=10).mean()
     result["trade_value_avg20_prior"] = result["trade_value"].shift(1).rolling(20, min_periods=10).mean()
     result["volume_ratio"] = result["volume"] / result["volume_avg20_prior"].replace(0, np.nan)
+    previous_close = result["close"].shift(1)
+    true_range = pd.concat(
+        [
+            result["high"] - result["low"],
+            (result["high"] - previous_close).abs(),
+            (result["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    result["atr14"] = true_range.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    up_move = result["high"].diff()
+    down_move = -result["low"].diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    atr_for_adx = result["atr14"].replace(0, np.nan)
+    plus_di = 100.0 * plus_dm.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean() / atr_for_adx
+    minus_di = 100.0 * minus_dm.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean() / atr_for_adx
+    plus_di = plus_di.mask(result["atr14"] == 0, 0.0)
+    minus_di = minus_di.mask(result["atr14"] == 0, 0.0)
+    di_sum = plus_di + minus_di
+    dx = (100.0 * (plus_di - minus_di).abs() / di_sum.replace(0, np.nan)).mask(
+        di_sum == 0, 0.0
+    )
+    result["adx14"] = dx.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
+    result["plus_di14"] = plus_di
+    result["minus_di14"] = minus_di
     return result
 
 
@@ -113,14 +160,40 @@ def resample_weekly(frame: pd.DataFrame) -> pd.DataFrame:
         "volume": "sum",
         "trade_value": "sum",
     }
-    return prepared.resample("W-FRI").agg(aggregation).dropna(subset=["open", "high", "low", "close"])
+    weekly = prepared.resample("W-FRI").agg(aggregation).dropna(
+        subset=["open", "high", "low", "close"]
+    )
+    # ``W-FRI`` labels an unfinished Monday-Thursday bucket with the coming
+    # Friday.  Using that partial bucket as the higher-timeframe confirmation
+    # makes a live Friday-morning analysis depend on an incomplete weekly bar.
+    # Keep only weekly buckets whose Friday label is no later than the latest
+    # completed daily bar.  This is deliberately conservative on Friday
+    # holidays: the prior fully labelled week is used instead of pretending a
+    # Thursday close is a completed Friday bar.
+    latest_daily_date = pd.Timestamp(prepared.index[-1]).date()
+    weekly_dates = pd.DatetimeIndex(weekly.index).date
+    return weekly.loc[weekly_dates <= latest_daily_date]
 
 
 def analyze_ichimoku(frame: pd.DataFrame, *, timeframe: str = "일봉") -> IchimokuReading:
     ind = calculate_ichimoku(frame)
     row = ind.iloc[-1]
     previous = ind.iloc[-2]
-    values = [row.get(name) for name in ("tenkan", "kijun", "cloud_top", "cloud_bottom", "span_a_raw", "span_b_raw")]
+    values = [
+        row.get(name)
+        for name in (
+            "tenkan",
+            "kijun",
+            "cloud_top",
+            "cloud_bottom",
+            "span_a_raw",
+            "span_b_raw",
+            "atr14",
+            "adx14",
+            "plus_di14",
+            "minus_di14",
+        )
+    ]
     if not all(_finite(value) for value in values):
         raise ValueError("현재 캔들에서 일목균형표 값을 완성하지 못했습니다.")
 
@@ -179,6 +252,12 @@ def analyze_ichimoku(frame: pd.DataFrame, *, timeframe: str = "일봉") -> Ichim
     avg_volume = _as_float(row.get("volume_avg20_prior"))
     avg_trade_value = _as_float(row.get("trade_value_avg20_prior"))
     candle_range_pct = max(0.0, (float(row["high"]) - float(row["low"])) / close * 100.0)
+    atr14 = float(row["atr14"])
+    atr14_pct = atr14 / close * 100.0 if close > 0 else 0.0
+    candle_range_atr = (float(row["high"]) - float(row["low"])) / atr14 if atr14 > 0 else 0.0
+    adx14 = float(row["adx14"])
+    plus_di14 = float(row["plus_di14"])
+    minus_di14 = float(row["minus_di14"])
     cloud_thickness = max(0.0, (cloud_top - cloud_bottom) / close * 100.0)
     kijun_distance = (close / kijun - 1.0) * 100.0 if kijun > 0 else 0.0
     crosses = _cross_count(tk_diff.tail(15))
@@ -221,6 +300,18 @@ def analyze_ichimoku(frame: pd.DataFrame, *, timeframe: str = "일봉") -> Ichim
     elif future_cloud == "음의 구름":
         bearish += 1
         risks.append("앞으로 표시되는 구름 모양이 아직 약세입니다.")
+    if adx14 >= 25.0 and plus_di14 > minus_di14:
+        bullish += 1
+        reasons.append(
+            f"ADX {adx14:.1f}, +DI {plus_di14:.1f} > -DI {minus_di14:.1f}로 상승 추세 힘이 확인됩니다."
+        )
+    elif adx14 >= 25.0 and minus_di14 > plus_di14:
+        bearish += 1
+        risks.append(
+            f"ADX {adx14:.1f}, -DI {minus_di14:.1f} > +DI {plus_di14:.1f}로 하락 방향 추세 힘이 강합니다."
+        )
+    elif adx14 < 18.0:
+        risks.append(f"ADX {adx14:.1f}로 추세 힘이 약해 횡보 가능성이 있습니다.")
     if breakout == "상향 돌파":
         if volume_ratio is not None and volume_ratio >= 1.0:
             bullish += 2
@@ -228,25 +319,29 @@ def analyze_ichimoku(frame: pd.DataFrame, *, timeframe: str = "일봉") -> Ichim
         else:
             risks.append("구름을 넘었지만 거래량 확인이 부족합니다.")
             hard_blocks.append("거래량 없는 첫 돌파는 다음 종가 확인이 필요합니다.")
-    if candle_range_pct > 6.0:
-        risks.append(f"오늘 캔들 폭이 {candle_range_pct:.1f}%로 커서 추격 위험이 있습니다.")
+    if candle_range_atr > 2.5:
+        risks.append(
+            f"오늘 캔들 폭이 ATR의 {candle_range_atr:.2f}배로 커서 추격 위험이 있습니다."
+        )
         hard_blocks.append("너무 긴 캔들 뒤 추격 진입을 보류합니다.")
-    if abs(kijun_distance) > 10.0 and close > kijun:
-        risks.append(f"주가가 중기선보다 {kijun_distance:.1f}% 높아 눌림 위험이 있습니다.")
+    kijun_distance_atr = abs(close - kijun) / atr14 if atr14 > 0 else 0.0
+    if kijun_distance_atr > 3.0 and close > kijun:
+        risks.append(
+            f"주가가 기준선에서 ATR의 {kijun_distance_atr:.2f}배 떨어져 있어 눌림 위험이 있습니다."
+        )
         hard_blocks.append("중기선과 거리가 너무 멉니다.")
     if crosses >= 3:
         risks.append("단기선과 중기선이 최근 자주 엇갈려 횡보 가능성이 있습니다.")
     if cloud_thickness < 0.7:
         risks.append("구름이 얇아 방향이 쉽게 뒤집힐 수 있습니다.")
 
-    risk_score = len(risks) + len(hard_blocks) * 2
     complete_bullish = (
         price_position == "구름 위"
         and tenkan > kijun
         and kijun_slope in {"상승", "수평"}
         and chikou == "강세 확인"
         and future_cloud == "양의 구름"
-        and abs(kijun_distance) <= 10.0
+        and kijun_distance_atr <= 3.0
     )
     if complete_bullish:
         grade = "A+"
@@ -293,12 +388,34 @@ def analyze_ichimoku(frame: pd.DataFrame, *, timeframe: str = "일봉") -> Ichim
         if value > close * 1.005
     ]
     watch_price = max(value for value in (kijun, cloud_top) if _finite(value))
-    nearest_support = max(supports) if supports else close * 0.94
-    invalidation = nearest_support * 0.99
-    risk_per_share = max(close - invalidation, close * 0.025)
-    first_target = min(resistance_candidates) if resistance_candidates else close + risk_per_share * 2.0
-    if first_target <= close * 1.02:
-        first_target = close + risk_per_share * 2.0
+    nearest_support = max(supports) if supports else close - max(atr14 * 2.0, close * 0.04)
+    invalidation = nearest_support - max(atr14 * 0.35, close * 0.003)
+    minimum_risk = max(atr14 * 0.8, close * 0.015)
+    invalidation = max(0.01, min(invalidation, close - minimum_risk))
+    risk_per_share = max(0.01, close - invalidation)
+    first_target = min(resistance_candidates) if resistance_candidates else None
+    reward = max(0.0, first_target - close) if first_target is not None else 0.0
+    reward_risk_ratio = (
+        reward / risk_per_share if resistance_candidates and risk_per_share > 0 else 0.0
+    )
+    if resistance_candidates and reward_risk_ratio < 1.5:
+        risks.append(
+            f"가까운 저항까지 손익비가 {reward_risk_ratio:.2f}:1로 낮아 신규 진입 효율이 떨어집니다."
+        )
+        hard_blocks.append("첫 저항까지 기대 손익비가 부족합니다.")
+    elif not resistance_candidates:
+        risks.append("확인된 상단 저항이 없어 목표 가격과 손익비를 산정할 수 없습니다.")
+        hard_blocks.append("첫 저항·목표 후보를 확인하지 못했습니다.")
+
+    # Some risk controls (notably reward/risk) are only known after support
+    # and resistance levels are built.  Recompute the summary fields here so
+    # they can never disagree with the final returned blocks/risks.
+    risk_score = len(risks) + len(hard_blocks) * 2
+    confidence = (
+        "높음"
+        if confidence_points >= 5 and not hard_blocks
+        else "보통" if confidence_points >= 3 else "낮음"
+    )
 
     if grade == "A+" and not hard_blocks:
         action = "관심 후보 - 현재가 추격보다 지지 확인 후 판단"
@@ -330,6 +447,12 @@ def analyze_ichimoku(frame: pd.DataFrame, *, timeframe: str = "일봉") -> Ichim
         avg_volume_20=avg_volume,
         avg_trade_value_20=avg_trade_value,
         candle_range_pct=candle_range_pct,
+        atr14=atr14,
+        atr14_pct=atr14_pct,
+        candle_range_atr=candle_range_atr,
+        adx14=adx14,
+        plus_di14=plus_di14,
+        minus_di14=minus_di14,
         flat_span_b_levels=flat_levels,
         volume_profile_levels=volume_levels,
         grade=grade,
@@ -342,7 +465,8 @@ def analyze_ichimoku(frame: pd.DataFrame, *, timeframe: str = "일봉") -> Ichim
         risks=tuple(dict.fromkeys(risks)),
         watch_price=watch_price,
         invalidation_price=max(0.01, invalidation),
-        first_target_price=max(0.01, first_target),
+        first_target_price=first_target,
+        reward_risk_ratio=max(0.0, reward_risk_ratio),
         action=action,
     )
 
@@ -358,7 +482,10 @@ def apply_context(
     risks = list(reading.risks)
     action = reading.action
     higher = "확인 불가"
-    if weekly is not None:
+    if weekly is None:
+        blocks.append("상위 시간대인 주봉 데이터를 충분히 확인하지 못했습니다.")
+        risks.append("주봉 확인이 부족해 일봉 단독 신호의 신뢰도를 낮춥니다.")
+    else:
         if weekly.grade in {"A+", "A"} and weekly.price_position == "구름 위":
             higher = "주봉도 상승 방향"
         elif weekly.price_position == "구름 아래" or weekly.grade == "D":
@@ -376,11 +503,17 @@ def apply_context(
         risks.append("미국 대형주 시장과 기술주 시장의 방향이 아직 맞지 않습니다.")
     if blocks and reading.grade in {"A+", "A", "B"}:
         action = "기다림 - 종목·주봉·시장 방향이 함께 좋아질 때 재확인"
+    blocks = list(dict.fromkeys(blocks))
+    risks = list(dict.fromkeys(risks))
+    confidence = reading.confidence
+    if (blocks or len(risks) > len(reading.risks)) and confidence == "높음":
+        confidence = "보통"
     return replace(
         reading,
         hard_blocks=tuple(dict.fromkeys(blocks)),
         risks=tuple(dict.fromkeys(risks)),
-        risk_score=reading.risk_score + max(0, len(blocks) - len(reading.hard_blocks)) * 2,
+        risk_score=len(risks) + len(blocks) * 2,
+        confidence=confidence,
         action=action,
         higher_timeframe=higher,
         market_context=market_label,

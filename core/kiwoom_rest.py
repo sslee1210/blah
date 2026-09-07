@@ -104,6 +104,9 @@ class _RateLimiter:
             self._last = time.monotonic()
 
 
+_SHARED_RATE_LIMITER = _RateLimiter()
+
+
 class KiwoomRestClient:
     """Authenticated client implementing token refresh, paging and retries."""
 
@@ -123,7 +126,8 @@ class KiwoomRestClient:
         self._token_expires_at = datetime.min.replace(tzinfo=timezone.utc)
         self._token_lock = threading.Lock()
         self._thread_local = threading.local()
-        self._limiter = _RateLimiter()
+        # Domestic and US clients can coexist in the same GUI process.
+        self._limiter = _SHARED_RATE_LIMITER
 
     def _session(self) -> requests.Session:
         session = getattr(self._thread_local, "session", None)
@@ -143,6 +147,7 @@ class KiwoomRestClient:
             ):
                 return self._token
             try:
+                self._limiter.wait()
                 response = self._session().post(
                     f"{self.base_url}/oauth2/token",
                     json={
@@ -156,7 +161,9 @@ class KiwoomRestClient:
                 payload = response.json()
             except (requests.RequestException, ValueError) as exc:
                 raise KiwoomRestError("키움 REST 접근토큰 발급에 실패했습니다.") from exc
-            token = str(payload.get("token", "")).strip()
+            if not isinstance(payload, dict):
+                raise KiwoomRestError("키움 REST 접근토큰 응답 형식이 올바르지 않습니다.")
+            token = str(payload.get("token") or "").strip()
             if not token:
                 message = str(payload.get("return_msg", "인증 정보 확인 필요"))
                 raise KiwoomRestError(f"키움 REST 인증 실패: {message}")
@@ -277,15 +284,20 @@ class KiwoomRestClient:
                 cont_yn=cont_yn,
                 next_key=next_key,
             )
-            value = payload.get(list_key, [])
-            if isinstance(value, list):
-                rows.extend(item for item in value if isinstance(item, dict))
+            value = payload.get(list_key)
+            if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+                raise KiwoomRestError(f"{api_id} 목록 응답 형식이 올바르지 않습니다: {list_key}")
+            rows.extend(value)
             if max_rows is not None and len(rows) >= max_rows:
                 return rows[:max_rows]
             has_more = str(headers.get("cont-yn", "N")).upper() == "Y"
             new_key = str(headers.get("next-key", "")).strip()
-            if not has_more or not new_key or new_key in seen_keys:
-                break
+            if not has_more:
+                return rows
+            if not new_key or new_key in seen_keys:
+                raise KiwoomRestError(f"{api_id} 연속 조회 키가 누락되거나 반복되어 수집을 완료하지 못했습니다.")
+            if page + 1 >= max(1, max_pages):
+                raise KiwoomRestError(f"{api_id} 연속 조회 페이지 한도를 초과해 수집을 완료하지 못했습니다.")
             seen_keys.add(new_key)
             cont_yn, next_key = "Y", new_key
             if page_delay > 0:
@@ -482,7 +494,10 @@ def _daily_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
         if pd.notna(timestamp) and all(values[key] is not None for key in ("open", "high", "low", "close")):
             records.append(values)
     if not records:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "trade_value"])
+        return pd.DataFrame(
+            columns=["open", "high", "low", "close", "volume", "trade_value"],
+            index=pd.DatetimeIndex([], name="timestamp"),
+        )
     frame = pd.DataFrame.from_records(records).drop_duplicates("timestamp", keep="first")
     frame = frame.sort_values("timestamp").set_index("timestamp")
     frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0)
@@ -572,7 +587,10 @@ def _minute_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
         if pd.notna(timestamp) and all(values[key] is not None for key in ("open", "high", "low", "close")):
             records.append(values)
     if not records:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        return pd.DataFrame(
+            columns=["open", "high", "low", "close", "volume"],
+            index=pd.DatetimeIndex([], name="timestamp", tz=US_EASTERN),
+        )
     frame = pd.DataFrame.from_records(records).drop_duplicates("timestamp", keep="first")
     frame = frame.sort_values("timestamp").set_index("timestamp")
     frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0)
@@ -599,8 +617,16 @@ def _parse_us_chart_time(value: Any, business_date: Any = None) -> pd.Timestamp:
     return naive.tz_localize(US_EASTERN, nonexistent="shift_forward", ambiguous="NaT")
 
 
-def regular_session_minute_bars(frame: pd.DataFrame) -> pd.DataFrame:
-    """Keep only Kiwoom's hourly buckets that overlap the US regular session."""
+def regular_session_minute_bars(
+    frame: pd.DataFrame, *, interval_minutes: int = 60
+) -> pd.DataFrame:
+    """Keep only bars fully contained in the US 09:30-16:00 regular session.
+
+    Kiwoom labels intraday buckets by their start time.  A 60-minute 09:00
+    bucket therefore contains 30 minutes of pre-market data and a 16:00
+    bucket is after-hours.  Both used to leak extended-session movement into
+    the GUI's "60분봉" confirmation.
+    """
 
     if frame.empty:
         return frame.copy()
@@ -610,6 +636,31 @@ def regular_session_minute_bars(frame: pd.DataFrame) -> pd.DataFrame:
     else:
         index = index.tz_convert(US_EASTERN)
     minutes = index.hour * 60 + index.minute
-    # Kiwoom labels the opening partial bucket 09:00 and the closing bucket
-    # 16:00.  Overnight/extended buckets (04-08, 17-27) are excluded.
-    return frame.loc[(minutes >= 9 * 60) & (minutes <= 16 * 60)].copy()
+    session_open = 9 * 60 + 30
+    session_close = REGULAR_SESSION_CLOSE_MINUTE
+    return frame.loc[
+        (minutes >= session_open) & (minutes + interval_minutes <= session_close)
+    ].copy()
+
+
+def completed_us_minute_bars(
+    frame: pd.DataFrame,
+    *,
+    interval_minutes: int,
+    now: datetime | None = None,
+) -> pd.DataFrame:
+    """Remove the still-forming current US intraday bucket."""
+
+    if frame.empty:
+        return frame.copy()
+    local_now = _eastern_datetime(now)
+    index = pd.DatetimeIndex(frame.index)
+    if index.tz is None:
+        index = index.tz_localize(US_EASTERN)
+    else:
+        index = index.tz_convert(US_EASTERN)
+    keep = [
+        stamp + pd.Timedelta(minutes=interval_minutes) <= pd.Timestamp(local_now)
+        for stamp in index
+    ]
+    return frame.loc[keep].copy()

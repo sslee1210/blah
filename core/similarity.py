@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .ichimoku import calculate_ichimoku
+from .ichimoku import MIN_BARS, calculate_ichimoku
 
 
 FEATURES = (
@@ -26,10 +26,14 @@ FEATURES = (
     "cloud_width_pct",
     "volume_ratio",
     "candle_range_pct",
+    "atr14_pct",
+    "adx14",
+    "di_spread14",
 )
 
 MIN_RELIABLE_SAMPLE = 25
 MAX_NEIGHBORS = 30
+OUTCOME_HORIZON = 10
 REQUIRED_ICHIMOKU_STATES = (
     "price_position",
     "future_cloud",
@@ -56,6 +60,9 @@ class SimilarityResult:
     average_down_return_pct: float | None = None
     invalidation_count: int = 0
     invalidation_rate: float | None = None
+    expected_return_pct: float | None = None
+    downside_p25_pct: float | None = None
+    payoff_ratio: float | None = None
 
 
 def feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -91,6 +98,9 @@ def feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
     output["candle_range_pct"] = (
         (result["high"] - result["low"]) / close.replace(0, np.nan) * 100.0
     )
+    output["atr14_pct"] = result["atr14"] / close.replace(0, np.nan) * 100.0
+    output["adx14"] = result["adx14"]
+    output["di_spread14"] = result["plus_di14"] - result["minus_di14"]
     output["price_position"] = np.where(
         close > result["cloud_top"],
         "above",
@@ -124,18 +134,24 @@ def feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
         ["strong", "partial", "weak"],
         default="mixed",
     )
+    # Historical matches must have enough data for the same Ichimoku reading
+    # used today. Before the 52+26 cloud is ready, pandas' row-wise max/min can
+    # otherwise make a half-cloud look complete and admit false matches.
+    output.loc[output.index[: MIN_BARS - 1], list(FEATURES)] = np.nan
 
     support_columns = ["tenkan", "kijun", "cloud_top", "cloud_bottom"]
     supports = result[support_columns].where(result[support_columns].lt(close, axis=0))
     nearest_support = supports.max(axis=1).fillna(close * 0.94)
     output["research_invalidation_price"] = nearest_support * 0.99
-    future_lows = pd.concat([result["low"].shift(-offset) for offset in range(1, 11)], axis=1)
-    output["future_low_10"] = future_lows.min(axis=1)
+    future_lows = pd.concat(
+        [result["low"].shift(-offset) for offset in range(1, OUTCOME_HORIZON + 1)], axis=1
+    )
+    output["future_low_10"] = future_lows.min(axis=1, skipna=False)
     output["invalidation_hit"] = (
         output["future_low_10"] <= output["research_invalidation_price"]
-    )
+    ).astype("boolean").mask(output["future_low_10"].isna())
     output["entry"] = result["open"].shift(-1)
-    output["exit"] = result["close"].shift(-10)
+    output["exit"] = result["close"].shift(-OUTCOME_HORIZON)
     output["forward_return_pct"] = (output["exit"] / output["entry"] - 1.0) * 100.0
     return output.replace([np.inf, -np.inf], np.nan)
 
@@ -143,7 +159,7 @@ def feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
 def summarize_similarity(frame: pd.DataFrame, *, neighbors: int = MAX_NEIGHBORS) -> SimilarityResult:
     features = feature_frame(frame)
     current = features.iloc[-1]
-    history = features.iloc[:-10].dropna(subset=[*FEATURES, "forward_return_pct"])
+    history = features.iloc[:-OUTCOME_HORIZON].dropna(subset=[*FEATURES, "forward_return_pct"])
     if any(not _finite(current.get(feature)) for feature in FEATURES) or len(history) < 25:
         return SimilarityResult(0, 0, None, None, 0, 0, None, None, "표본 부족")
 
@@ -180,9 +196,15 @@ def summarize_similarity(frame: pd.DataFrame, *, neighbors: int = MAX_NEIGHBORS)
         index=matrix.index,
     )
     count = min(max(10, neighbors), len(match_scores))
-    nearest_indices = match_scores.sort_values(
+    ordered_indices = match_scores.sort_values(
         ["largest_indicator_difference", "average_indicator_difference"]
-    ).head(count).index
+    ).index
+    nearest_indices = _purged_neighbor_indices(
+        ordered_indices,
+        all_index=features.index,
+        limit=count,
+        embargo=OUTCOME_HORIZON,
+    )
     selected = same_context.loc[nearest_indices].copy()
     selected["distance"] = match_scores.loc[nearest_indices, "largest_indicator_difference"]
 
@@ -223,6 +245,13 @@ def summarize_similarity(frame: pd.DataFrame, *, neighbors: int = MAX_NEIGHBORS)
         average_down_return_pct=float(returns[down].mean()) if down.any() else None,
         invalidation_count=invalidation_count,
         invalidation_rate=invalidation_count / sample_count * 100.0 if sample_count else None,
+        expected_return_pct=float(returns.mean()) if sample_count else None,
+        downside_p25_pct=float(returns.quantile(0.25)) if sample_count else None,
+        payoff_ratio=(
+            float(returns[up].mean() / abs(returns[down].mean()))
+            if up.any() and down.any() and float(returns[down].mean()) != 0
+            else None
+        ),
     )
 
 
@@ -237,6 +266,31 @@ def _context_candidates(
 
 def _pct(left: pd.Series, right: pd.Series) -> pd.Series:
     return (left / right.replace(0, np.nan) - 1.0) * 100.0
+
+
+def _purged_neighbor_indices(
+    ordered_indices: pd.Index,
+    *,
+    all_index: pd.Index,
+    limit: int,
+    embargo: int,
+) -> pd.Index:
+    """Keep nearest matches whose forward outcome windows do not overlap."""
+
+    positions = {value: position for position, value in enumerate(all_index)}
+    selected: list[object] = []
+    selected_positions: list[int] = []
+    for value in ordered_indices:
+        position = positions.get(value)
+        if position is None:
+            continue
+        if any(abs(position - previous) <= embargo for previous in selected_positions):
+            continue
+        selected.append(value)
+        selected_positions.append(position)
+        if len(selected) >= limit:
+            break
+    return pd.Index(selected)
 
 
 def _finite(value: object) -> bool:

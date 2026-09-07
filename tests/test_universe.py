@@ -35,3 +35,16 @@ def test_universe_blends_ranks_and_excludes_etf_and_low_price() -> None:
     assert [item.stock.symbol for item in selected] == ["AAPL"]
     assert stats["excluded_non_common_or_low_price"] == 3
 
+
+def test_universe_does_not_invent_common_stock_metadata_for_unverified_ranking() -> None:
+    selected, stats = build_scan_universe(FakeClient(), [], target_size=50)
+    assert selected == []
+    assert stats["excluded_unverified_master"] == 4
+
+
+def test_universe_does_not_borrow_master_identity_from_another_exchange() -> None:
+    master = [StockInfo("AAPL", "NY", "애플", "APPLE INC", "기술", False)]
+    selected, stats = build_scan_universe(FakeClient(), master, target_size=50)
+    assert selected == []
+    assert stats["excluded_unverified_master"] == 4
+

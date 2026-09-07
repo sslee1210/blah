@@ -1,7 +1,7 @@
 @echo off
 setlocal
 chcp 65001 >nul
-title Real2 US Ichimoku Analyzer
+title Real Integrated Stock Analyzer
 cd /d "%~dp0"
 
 where py >nul 2>nul
@@ -11,7 +11,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-py -3 -c "import pandas, numpy, requests" >nul 2>nul
+py -3 -c "import tkinter, pandas, numpy, requests" >nul 2>nul
 if errorlevel 1 (
     echo Installing required Python packages...
     py -3 -m pip install -r requirements.txt
@@ -22,11 +22,11 @@ if errorlevel 1 (
     )
 )
 
-py -3 us_ichimoku_analyzer.py %*
+py -3 stock_analyzer_gui.py
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" (
     echo.
-    echo Analyzer exited with error code %EXIT_CODE%.
+    echo GUI exited with error code %EXIT_CODE%.
     pause
 )
 exit /b %EXIT_CODE%

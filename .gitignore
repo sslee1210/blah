@@ -1,5 +1,6 @@
 .runtime/
 .us_ichimoku_cache/
+.domestic_ichimoku_cache/
 reports/
 __pycache__/
 .pytest_cache/

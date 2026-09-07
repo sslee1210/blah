@@ -28,6 +28,8 @@ from core.kiwoom_rest import (
     KiwoomRestError,
     Quote,
     StockInfo,
+    completed_daily_bars,
+    completed_us_minute_bars,
     regular_session_minute_bars,
 )
 from core.reporting import (
@@ -59,6 +61,10 @@ MIN_AVG_DOLLAR_VOLUME = max(
 SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.-]{0,11}$")
 
 
+class PartialScanError(KiwoomRestError):
+    """The report was saved, but some selected stocks failed after retries."""
+
+
 class USStockAnalyzer:
     def __init__(self, client: KiwoomRestClient, cache: CacheStore) -> None:
         self.client = client
@@ -72,10 +78,24 @@ class USStockAnalyzer:
         if cached is not None:
             self._master = cached
             return cached
+        stale = self.cache.load_master(max_age_hours=None)
         if not allow_network:
-            return []
+            return stale or []
         print("[준비] 미국 일반주 목록을 키움에서 한 번만 받아옵니다...")
-        stocks = self.client.stock_master("%")
+        try:
+            stocks = self.client.stock_master("%")
+        except KiwoomRestError:
+            if stale:
+                print("[주의] 최신 미국 종목목록 갱신에 실패해 이전 저장 목록을 사용합니다.")
+                self._master = stale
+                return stale
+            raise
+        if not stocks:
+            if stale:
+                print("[주의] 최신 미국 종목목록이 비어 있어 이전 저장 목록을 사용합니다.")
+                self._master = stale
+                return stale
+            raise KiwoomRestError("미국 일반주 종목 목록을 만들지 못했습니다.")
         self.cache.save_master(stocks)
         self._master = stocks
         print(f"[준비 완료] 미국 종목 {len(stocks):,}개를 확인했습니다.")
@@ -326,11 +346,14 @@ class USStockAnalyzer:
 
         liquid, reason = _liquidity(daily)
         if not liquid:
+            blocks = tuple(dict.fromkeys((*daily.hard_blocks, reason)))
+            risks = tuple(dict.fromkeys((*daily.risks, reason)))
             daily = replace(
                 daily,
-                hard_blocks=tuple(dict.fromkeys((*daily.hard_blocks, reason))),
-                risks=tuple(dict.fromkeys((*daily.risks, reason))),
-                risk_score=daily.risk_score + 3,
+                hard_blocks=blocks,
+                risks=risks,
+                risk_score=len(risks) + len(blocks) * 2,
+                confidence="낮음" if daily.confidence == "낮음" else "보통",
                 action="피하기 - 거래량·거래대금이 부족해 매매 후보에서 제외",
             )
         return AnalyzedStock(
@@ -345,13 +368,19 @@ class USStockAnalyzer:
 
     def _daily(self, stock: StockInfo, *, full_history: bool) -> pd.DataFrame:
         cached = self.cache.load_daily(stock, fresh_only=True)
-        required_rows = 600 if full_history else 420
+        if cached is not None:
+            cached = completed_daily_bars(cached)
+        # Similarity samples use a 10-session embargo so the outcome windows do
+        # not overlap.  Keep a long window even for the full-market scan; a
+        # shorter ~420-row window produces too few independent historical
+        # examples after purging and makes the ranking noisier.
+        required_rows = 600
         if cached is not None and len(cached) >= required_rows:
-            return cached.tail(650 if full_history else 460)
+            return cached.tail(650)
         frame = self.client.daily_bars(
             stock,
-            calendar_days=1500 if full_history else 1000,
-            max_rows=650 if full_history else 460,
+            calendar_days=1500,
+            max_rows=650,
         )
         # The endpoint already returns a complete recent window.  Merging an
         # obsolete cache can create a multi-year hole that looks contiguous to
@@ -362,11 +391,13 @@ class USStockAnalyzer:
     def _minute(self, stock: StockInfo, *, interval: int) -> pd.DataFrame:
         cached = self.cache.load_minute(stock, interval, fresh_only=True)
         if cached is not None:
-            cached = regular_session_minute_bars(cached)
+            cached = regular_session_minute_bars(cached, interval_minutes=interval)
+            cached = completed_us_minute_bars(cached, interval_minutes=interval)
             if len(cached) >= 80:
                 return cached
         frame = self.client.minute_bars(stock, interval_minutes=interval, max_rows=500)
-        frame = regular_session_minute_bars(frame)
+        frame = regular_session_minute_bars(frame, interval_minutes=interval)
+        frame = completed_us_minute_bars(frame, interval_minutes=interval)
         if len(frame) < 80:
             raise KiwoomRestError(
                 f"{stock.symbol} 정규장 {interval}분봉 데이터가 {len(frame)}개뿐이라 부족합니다."
@@ -446,6 +477,13 @@ def _write_scan_csv(path: Path, results: list[AnalyzedStock]) -> None:
                     f"{value:.4f}" for value in daily.volume_profile_levels
                 ),
                 "volume_ratio": daily.volume_ratio,
+                "atr14": daily.atr14,
+                "atr14_pct": daily.atr14_pct,
+                "candle_range_atr": daily.candle_range_atr,
+                "adx14": daily.adx14,
+                "plus_di14": daily.plus_di14,
+                "minus_di14": daily.minus_di14,
+                "reward_risk_ratio": daily.reward_risk_ratio,
                 "avg_volume_20": daily.avg_volume_20,
                 "avg_trade_value_20_usd": daily.avg_trade_value_20,
                 "liquid": item.liquid,
@@ -460,10 +498,18 @@ def _write_scan_csv(path: Path, results: list[AnalyzedStock]) -> None:
                 "similar_average_down_return_pct": similarity.average_down_return_pct,
                 "similar_invalidation_count": similarity.invalidation_count,
                 "similar_invalidation_rate": similarity.invalidation_rate,
+                "similar_expected_return_pct": similarity.expected_return_pct,
+                "similar_downside_p25_pct": similarity.downside_p25_pct,
+                "similar_payoff_ratio": similarity.payoff_ratio,
                 "weekly_context": daily.higher_timeframe,
                 "market_context": daily.market_context,
                 "data_timestamp": daily.data_timestamp,
                 "source_range": daily.source_range,
+                "timeframe": daily.timeframe,
+                "ichimoku_parameters": "9,26,52",
+                "data_source": "키움 REST API 미국주식",
+                "timezone": "America/New_York",
+                "currency": "USD",
             }
         )
     pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
@@ -498,7 +544,7 @@ def single_instance() -> Iterator[None]:
         except (OSError, ValueError):
             pid = 0
         if _is_process_alive(pid):
-            raise RuntimeError("미국주식 분석기가 이미 실행 중입니다. 기존 창을 사용해 주세요.")
+            raise RuntimeError("다른 키움 주식 분석이 이미 실행 중입니다. 기존 작업이 끝난 뒤 다시 실행해 주세요.")
         LOCK_PATH.unlink(missing_ok=True)
     handle = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     try:
@@ -527,6 +573,8 @@ def _self_test() -> int:
         },
         index=dates,
     )
+    frame["high"] = frame[["high", "open", "close"]].max(axis=1)
+    frame["low"] = frame[["low", "open", "close"]].min(axis=1)
     frame["trade_value"] = frame["close"] * frame["volume"]
     reading = analyze_ichimoku(frame)
     similarity = summarize_similarity(frame)
@@ -539,13 +587,14 @@ def _self_test() -> int:
 
 def _credentials(store: CredentialStore, *, configure: bool) -> KiwoomCredentials:
     if configure:
-        store.clear()
         return store.configure_interactively()
     loaded = store.load()
     return loaded or store.configure_interactively()
 
 
-def run_command(analyzer: USStockAnalyzer, command: str) -> bool:
+def run_command(
+    analyzer: USStockAnalyzer, command: str, *, fail_on_partial: bool = False
+) -> bool:
     normalized = re.sub(r"\s+", " ", command.strip()).casefold()
     if normalized in {"종료", "q", "quit", "exit"}:
         return False
@@ -565,6 +614,8 @@ def run_command(analyzer: USStockAnalyzer, command: str) -> bool:
         print(f"\n완료: {len(results):,}개 분석 · 관심 후보 {interest_count:,}개 · 오류 {len(failures):,}개")
         print(f"HTML 보고서: {path}")
         print(f"Markdown 보고서: {path.with_suffix('.md')}\n")
+        if failures and fail_on_partial:
+            raise PartialScanError(f"전체 분석 중 {len(failures):,}개 종목에 실패했습니다. 저장된 보고서를 확인해 주세요.")
         return True
     if "분석" in normalized:
         result, path = analyzer.analyze_individual(command)
@@ -594,6 +645,9 @@ def main(argv: list[str] | None = None) -> int:
         return _self_test()
     try:
         credentials = _credentials(CredentialStore(CREDENTIAL_PATH), configure=args.configure)
+        if args.configure:
+            print("\n키움 REST API 키를 안전하게 다시 저장했습니다.")
+            return 0
         client = KiwoomRestClient(credentials)
         analyzer = USStockAnalyzer(client, CacheStore(CACHE_DIR))
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -604,7 +658,7 @@ def main(argv: list[str] | None = None) -> int:
             print("데이터: 키움 REST API 미국주식 / 통화: USD")
             _print_help()
             if args.once:
-                run_command(analyzer, args.once)
+                run_command(analyzer, args.once, fail_on_partial=True)
                 return 0
             while True:
                 try:
@@ -615,6 +669,9 @@ def main(argv: list[str] | None = None) -> int:
                 if command and not run_command(analyzer, command):
                     print("종료합니다.")
                     return 0
+    except PartialScanError as exc:
+        print(f"\n부분 완료: {exc}", file=sys.stderr)
+        return 2
     except (CredentialError, KiwoomRestError, InvalidSecurityError, RuntimeError) as exc:
         print(f"\n오류: {exc}", file=sys.stderr)
         return 1

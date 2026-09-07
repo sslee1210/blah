@@ -16,6 +16,7 @@ from core.kiwoom_rest import (
     completed_daily_bars,
     latest_completed_us_weekday,
     number,
+    completed_us_minute_bars,
     regular_session_minute_bars,
 )
 
@@ -79,8 +80,30 @@ def test_regular_session_filter_excludes_pre_and_after_hours() -> None:
         }
         for hour in (4, 9, 10, 16, 17, 26)
     ]
-    filtered = regular_session_minute_bars(_minute_frame(rows))
-    assert list(filtered.index.hour) == [9, 10, 16]
+    filtered = regular_session_minute_bars(_minute_frame(rows), interval_minutes=60)
+    assert list(filtered.index.hour) == [10]
+
+
+def test_current_us_60m_bucket_is_removed_until_complete() -> None:
+    index = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2026-09-03 10:00", tz=US_EASTERN),
+            pd.Timestamp("2026-09-03 11:00", tz=US_EASTERN),
+        ]
+    )
+    frame = pd.DataFrame(
+        {
+            "open": [100.0, 101.0],
+            "high": [102.0, 103.0],
+            "low": [99.0, 100.0],
+            "close": [101.0, 102.0],
+            "volume": [1000.0, 500.0],
+        },
+        index=index,
+    )
+    now = datetime(2026, 9, 3, 11, 31, tzinfo=US_EASTERN)
+    completed = completed_us_minute_bars(frame, interval_minutes=60, now=now)
+    assert list(completed.index.hour) == [10]
 
 
 def test_paging_passes_server_continuation_key(monkeypatch) -> None:
@@ -97,6 +120,41 @@ def test_paging_passes_server_continuation_key(monkeypatch) -> None:
     rows = client.paged("usa06012", "/api/us/chart", {}, list_key="result_list")
     assert rows == [{"id": 1}, {"id": 2}]
     assert calls == [("N", ""), ("Y", "NEXT")]
+
+
+@pytest.mark.parametrize("value", [None, {}, ["invalid row"]])
+def test_paging_rejects_malformed_lists(monkeypatch, value) -> None:
+    client = KiwoomRestClient(KiwoomCredentials("app", "secret"))
+    monkeypatch.setattr(client, "request", lambda *args, **kwargs: ({"rows": value}, {}))
+    with pytest.raises(KiwoomRestError, match="목록 응답 형식"):
+        client.paged("usa06012", "/chart", {}, list_key="rows")
+
+
+@pytest.mark.parametrize("key", ["", "REPEATED"])
+def test_paging_does_not_silently_accept_broken_continuation(monkeypatch, key) -> None:
+    client = KiwoomRestClient(KiwoomCredentials("app", "secret"))
+    monkeypatch.setattr(
+        client, "request", lambda *args, **kwargs: ({"rows": [{"id": 1}]}, {"cont-yn": "Y", "next-key": key})
+    )
+    with pytest.raises(KiwoomRestError, match="연속 조회 키"):
+        client.paged("usa06012", "/chart", {}, list_key="rows")
+
+
+def test_paging_reports_truncation_but_allows_an_explicit_row_limit(monkeypatch) -> None:
+    client = KiwoomRestClient(KiwoomCredentials("app", "secret"))
+    monkeypatch.setattr(
+        client, "request", lambda *args, **kwargs: ({"rows": [{"id": 1}]}, {"cont-yn": "Y", "next-key": "NEXT"})
+    )
+    with pytest.raises(KiwoomRestError, match="페이지 한도"):
+        client.paged("usa06012", "/chart", {}, list_key="rows", max_pages=1)
+    assert client.paged("usa06012", "/chart", {}, list_key="rows", max_pages=1, max_rows=1) == [{"id": 1}]
+
+
+def test_us_and_domestic_clients_share_query_spacing() -> None:
+    from core.domestic_kiwoom_rest import DomesticKiwoomRestClient
+
+    credentials = KiwoomCredentials("app", "secret")
+    assert KiwoomRestClient(credentials)._limiter is DomesticKiwoomRestClient(credentials)._limiter
 
 
 def test_stock_info_requires_a_valid_exchange_without_calling_network(monkeypatch) -> None:
@@ -144,6 +202,15 @@ def test_daily_request_rejects_an_old_api_window(monkeypatch) -> None:
     monkeypatch.setattr(client, "paged", lambda *args, **kwargs: rows)
     with pytest.raises(KiwoomRestError, match="최신 데이터가 아니므로"):
         client.daily_bars(stock, calendar_days=2000, max_rows=100)
+
+
+def test_empty_chart_responses_follow_insufficient_history_handling(monkeypatch) -> None:
+    client = KiwoomRestClient(KiwoomCredentials("app", "secret"))
+    stock = StockInfo("AAPL", "ND", "애플", "APPLE INC", "기술")
+    monkeypatch.setattr(client, "paged", lambda *args, **kwargs: [])
+    with pytest.raises(KiwoomRestError, match="일봉이 0개뿐"):
+        client.daily_bars(stock)
+    assert client.minute_bars(stock).empty
 
 
 def test_in_progress_daily_bar_is_removed_before_analysis() -> None:

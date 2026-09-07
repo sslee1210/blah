@@ -51,10 +51,6 @@ def build_scan_universe(
     """Blend market-cap and dollar-volume ranks, then cap sector crowding."""
 
     master_by_key = {(item.exchange, item.symbol): item for item in master}
-    master_by_symbol: dict[str, StockInfo] = {}
-    for item in master:
-        if item.symbol not in master_by_symbol or item.exchange == "ND":
-            master_by_symbol[item.symbol] = item
 
     cap_rows = client.ranking("usa20550", max_rows=max(target_size * 2, 300))
     value_rows = client.ranking("usa20540", max_rows=max(target_size * 2, 300))
@@ -80,27 +76,15 @@ def build_scan_universe(
     ingest(value_rows, "value")
     candidates: list[UniverseCandidate] = []
     excluded = 0
+    unverified = 0
     for (exchange, symbol), record in merged.items():
         row = record["row"]
-        stock = master_by_key.get((exchange, symbol)) or master_by_symbol.get(symbol)
+        stock = master_by_key.get((exchange, symbol))
         if stock is None:
-            stock = StockInfo(
-                symbol=symbol,
-                exchange=exchange,
-                korean_name=str(row.get("stk_nm", "")).strip(),
-                english_name=str(row.get("stk_enm", "")).strip(),
-                sector="미분류",
-                is_etf=False,
-            )
-        if stock.exchange != exchange:
-            stock = StockInfo(
-                symbol=stock.symbol,
-                exchange=exchange,
-                korean_name=stock.korean_name,
-                english_name=stock.english_name,
-                sector=stock.sector,
-                is_etf=stock.is_etf,
-            )
+            # Ranking rows do not prove that an instrument is a common stock.
+            # A stale/incomplete master must never turn an unknown ETF into one.
+            unverified += 1
+            continue
         price = number(row.get("cur_prc"), absolute=True) or 0.0
         if price < 5.0 or not is_supported_common_stock(stock):
             excluded += 1
@@ -154,6 +138,7 @@ def build_scan_universe(
     stats = {
         "ranked_unique": len(merged),
         "excluded_non_common_or_low_price": excluded,
+        "excluded_unverified_master": unverified,
         "selected": len(selected),
         "sector_count": len({item.stock.sector for item in selected}),
     }
