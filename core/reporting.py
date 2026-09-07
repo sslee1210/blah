@@ -44,59 +44,119 @@ def render_html_report(
   <meta name="color-scheme" content="light">
   <title>{safe_title}</title>
   <style>
-    :root {{ --ink:#172033; --muted:#667085; --line:#e3e8ef; --paper:#fff;
-      --bg:#f3f6fa; --navy:#102a43; --blue:#2563eb; --soft:#eef4ff; --warn:#fff7e6; }}
+    :root {{ --ink:#172033; --muted:#667085; --line:#dfe5ec; --paper:#fff;
+      --bg:#eef2f7; --navy:#132a46; --blue:#2563eb; --soft:#f2f6ff;
+      --green:#067647; --green-soft:#ecfdf3; --amber:#b54708; --amber-soft:#fff7ed;
+      --red:#b42318; --red-soft:#fef3f2; --slate:#475467; --slate-soft:#f2f4f7; }}
     * {{ box-sizing:border-box; }}
     body {{ margin:0; color:var(--ink); background:var(--bg); font-family:-apple-system,
       BlinkMacSystemFont,"Segoe UI","Noto Sans KR","Malgun Gothic",sans-serif;
-      font-size:15px; line-height:1.7; }}
-    .top {{ height:7px; background:linear-gradient(90deg,var(--navy),var(--blue),#38bdf8); }}
-    main {{ width:min(1120px,calc(100% - 32px)); margin:32px auto 56px; padding:42px 48px;
-      background:var(--paper); border:1px solid var(--line); border-radius:18px;
-      box-shadow:0 14px 40px rgba(16,42,67,.08); }}
-    h1 {{ margin:0 0 26px; color:var(--navy); font-size:clamp(25px,4vw,38px); line-height:1.25; }}
-    h2 {{ margin:38px 0 15px; padding-bottom:8px; border-bottom:2px solid var(--soft);
-      color:var(--navy); font-size:21px; }}
-    h3 {{ margin:28px 0 10px; color:var(--navy); font-size:17px; }}
+      font-size:15px; line-height:1.68; -webkit-font-smoothing:antialiased; }}
+    .top {{ height:6px; background:linear-gradient(90deg,var(--navy),var(--blue),#38bdf8); }}
+    main {{ width:min(1680px,calc(100% - 48px)); margin:30px auto 56px; padding:38px 44px 42px;
+      background:var(--paper); border:1px solid var(--line); border-radius:20px;
+      box-shadow:0 18px 48px rgba(16,42,67,.09); }}
+    .report-kicker {{ display:inline-flex; align-items:center; gap:8px; margin-bottom:14px;
+      color:#526174; font-size:11px; font-weight:750; letter-spacing:.14em; text-transform:uppercase; }}
+    .report-kicker::before {{ content:""; width:8px; height:8px; border-radius:50%; background:var(--blue);
+      box-shadow:0 0 0 4px #eaf1ff; }}
+    h1 {{ margin:0 0 24px; color:var(--navy); font-size:clamp(28px,3vw,40px); line-height:1.2;
+      letter-spacing:-.03em; }}
+    h2 {{ margin:42px 0 16px; padding:0 0 10px; border-bottom:1px solid #e6ebf1;
+      color:var(--navy); font-size:22px; line-height:1.35; letter-spacing:-.02em; }}
+    h3 {{ margin:30px 0 12px; color:var(--navy); font-size:18px; }}
     p {{ margin:10px 0; }}
     ul {{ margin:8px 0 16px; padding-left:22px; }}
     li {{ margin:5px 0; }}
-    blockquote {{ margin:18px 0; padding:16px 20px; background:var(--soft);
-      border-left:5px solid var(--blue); border-radius:8px; color:#243b53; }}
-    blockquote p {{ margin:2px 0; }}
-    .table-wrap {{ width:100%; margin:12px 0 22px; border:1px solid var(--line);
-      border-radius:10px; }}
-    table {{ width:100%; border-collapse:collapse; table-layout:fixed; font-size:13px; }}
-    th {{ color:#fff; background:var(--navy); font-weight:650; text-align:left; }}
-    th,td {{ padding:10px 9px; border-bottom:1px solid var(--line); vertical-align:top;
-      white-space:normal; overflow-wrap:anywhere; word-break:keep-all; }}
+    li::marker {{ color:#7b8da3; }}
+    blockquote {{ margin:18px 0; padding:17px 20px; background:linear-gradient(135deg,#f5f8ff,#eef4ff);
+      border:1px solid #dce7ff; border-left:4px solid var(--blue); border-radius:12px; color:#243b53; }}
+    blockquote p {{ margin:3px 0; }}
+    .scan-summary {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px;
+      margin:18px 0 22px; padding:16px; border:1px solid #dfe7f2; border-radius:14px;
+      background:linear-gradient(135deg,#f8fbff,#f4f7fb); }}
+    .summary-metric {{ min-width:0; padding:15px 17px; border-radius:11px; background:#fff;
+      border:1px solid #e5eaf0; box-shadow:0 4px 12px rgba(16,42,67,.04); }}
+    .summary-metric span {{ display:block; color:var(--muted); font-size:12px; font-weight:700; }}
+    .summary-metric strong {{ display:inline-block; margin-top:3px; font-size:25px; line-height:1.1;
+      letter-spacing:-.03em; font-variant-numeric:tabular-nums; }}
+    .summary-metric em {{ margin-left:4px; color:var(--muted); font-size:12px; font-style:normal; }}
+    .summary-metric.good strong {{ color:var(--green); }}
+    .summary-metric.wait strong {{ color:var(--amber); }}
+    .summary-metric.avoid strong {{ color:var(--red); }}
+    .summary-note {{ grid-column:1/-1; margin:2px 2px 0; color:#536273; font-size:13px; }}
+    .table-wrap {{ width:100%; margin:13px 0 24px; overflow:hidden; border:1px solid var(--line);
+      border-radius:12px; background:#fff; box-shadow:0 5px 18px rgba(16,42,67,.045); }}
+    .table-wrap.wide {{ overflow-x:auto; scrollbar-width:thin; scrollbar-color:#b9c3d0 transparent; }}
+    table {{ width:100%; border-collapse:separate; border-spacing:0; table-layout:auto; font-size:15px;
+      line-height:1.62; }}
+    .table-wrap.wide table {{ min-width:1120px; }}
+    th {{ position:sticky; top:0; z-index:1; color:#fff; background:var(--navy); font-weight:700;
+      text-align:left; letter-spacing:-.01em; }}
+    th,td {{ padding:15px 14px; border-bottom:1px solid var(--line); vertical-align:top;
+      white-space:normal; overflow-wrap:break-word; word-break:keep-all; }}
     tbody tr:nth-child(even) {{ background:#f8fafc; }}
-    tbody tr:hover {{ background:#eef6ff; }}
+    tbody tr:hover {{ background:#f1f6fc; }}
     tbody tr:last-child td {{ border-bottom:0; }}
-    th:nth-child(2),td:nth-child(2) {{ text-align:center; }}
+    td.cell-stock {{ min-width:165px; font-weight:700; color:#20334d; }}
+    .stock-market {{ display:block; margin-top:4px; color:#667085; font-size:11.5px; font-weight:650; }}
+    td.cell-market,td.cell-grade,td.cell-quality,td.cell-money {{ white-space:nowrap; }}
+    td.cell-action {{ min-width:220px; }}
+    td.cell-levels {{ min-width:190px; font-variant-numeric:tabular-nums; }}
+    td.cell-history {{ min-width:200px; }}
+    td.cell-range {{ min-width:210px; color:#526174; }}
+    .grade-badge,.status-badge {{ display:inline-flex; align-items:center; justify-content:center;
+      border-radius:999px; font-weight:750; white-space:nowrap; }}
+    .grade-badge {{ min-width:34px; padding:3px 8px; font-size:12px; }}
+    .grade-aplus,.grade-a {{ color:var(--green); background:var(--green-soft); border:1px solid #abefc6; }}
+    .grade-b {{ color:#175cd3; background:#eff8ff; border:1px solid #b2ddff; }}
+    .grade-c {{ color:var(--amber); background:var(--amber-soft); border:1px solid #fedf89; }}
+    .grade-d {{ color:var(--red); background:var(--red-soft); border:1px solid #fecdca; }}
+    .status-badge {{ margin:0 7px 4px 0; padding:3px 8px; font-size:11px; }}
+    .status-good {{ color:var(--green); background:var(--green-soft); border:1px solid #abefc6; }}
+    .status-wait {{ color:var(--amber); background:var(--amber-soft); border:1px solid #fedf89; }}
+    .status-avoid {{ color:var(--red); background:var(--red-soft); border:1px solid #fecdca; }}
+    .status-neutral {{ color:var(--slate); background:var(--slate-soft); border:1px solid #d0d5dd; }}
+    .status-detail {{ display:block; margin-top:5px; color:#344054; line-height:1.5; }}
+    .price-line {{ display:flex; align-items:baseline; justify-content:space-between; gap:12px;
+      padding:3px 0; white-space:nowrap; border-bottom:1px dashed #edf0f4; }}
+    .price-line:last-child {{ border-bottom:0; }}
+    .price-line span {{ color:#667085; font-size:12px; font-weight:650; }}
+    .price-line strong {{ color:#1d2939; font-size:13px; font-weight:750; font-variant-numeric:tabular-nums; }}
     code {{ padding:2px 6px; border-radius:5px; background:#eef2f6; color:#334e68; }}
     strong {{ color:#0f3d75; }}
-    .footer {{ margin-top:38px; color:var(--muted); font-size:12px; text-align:right; }}
+    .footer {{ margin-top:42px; padding-top:16px; border-top:1px solid #e8edf2;
+      color:var(--muted); font-size:12px; text-align:right; }}
+    @media (max-width:980px) {{
+      main {{ width:calc(100% - 24px); margin:14px auto 34px; padding:30px 24px 34px; }}
+      .table-wrap.wide table {{ min-width:1080px; }}
+    }}
     @media (max-width:760px) {{
-      main {{ width:100%; margin:0; padding:26px 18px; border:0; border-radius:0; box-shadow:none; }}
-      .top {{ height:5px; }} h2 {{ margin-top:30px; }}
-      .table-wrap {{ border:0; }} table,tbody,tr,td {{ display:block; width:100%; }}
+      body {{ background:#fff; }}
+      main {{ width:100%; margin:0; padding:24px 16px 30px; border:0; border-radius:0; box-shadow:none; }}
+      .top {{ height:5px; }} .report-kicker {{ margin-bottom:10px; }} h2 {{ margin-top:32px; }}
+      .scan-summary {{ grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; padding:9px; }}
+      .summary-metric {{ padding:11px 9px; }} .summary-metric strong {{ font-size:22px; }}
+      .table-wrap {{ border:0; }} .table-wrap.wide table {{ min-width:0; }}
+      table,tbody,tr,td {{ display:block; width:100%; }}
       thead {{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
         clip:rect(0,0,0,0); white-space:nowrap; border:0; }}
       tbody tr {{ margin:0 0 14px; padding:6px 12px; border:1px solid var(--line);
         border-radius:10px; background:#fff !important; box-shadow:0 3px 12px rgba(16,42,67,.05); }}
       tbody td {{ display:grid; grid-template-columns:minmax(92px,34%) 1fr; gap:10px;
-        padding:8px 2px; text-align:left !important; border-bottom:1px solid var(--line); }}
+        min-width:0 !important; padding:8px 2px; text-align:left !important;
+        white-space:normal !important; border-bottom:1px solid var(--line); }}
       tbody td:last-child {{ border-bottom:0; }}
       tbody td::before {{ content:attr(data-label); color:var(--muted); font-weight:650; }}
     }}
-    @media print {{ body {{ background:#fff; }} .top {{ display:none; }} main {{ width:100%; margin:0;
-      padding:0; border:0; box-shadow:none; }} }}
+    @media print {{ body {{ background:#fff; }} .top,.report-kicker {{ display:none; }} main {{ width:100%; margin:0;
+      padding:0; border:0; box-shadow:none; }} th {{ position:static; }} .table-wrap {{ box-shadow:none; }} }}
   </style>
 </head>
 <body>
 <div class="top"></div>
 <main>
+<div class="report-kicker">REAL MARKET ANALYSIS REPORT</div>
 {body}
 <div class="footer">{safe_footer}</div>
 </main>
@@ -180,18 +240,17 @@ def render_individual_report(result: AnalyzedStock) -> str:
             "| 항목 | 가격 | 쉬운 뜻 |",
             "|---|---:|---|",
             f"| {price_label} | {usd(live_price)} | {price_context} |",
-            f"| 분석 기준 종가 | {usd(daily.close)} | {daily.data_timestamp} 완료 일봉; 등급·손익비·가격 기준의 계산값입니다. |",
-            f"| 확인할 가격 | {usd(daily.watch_price)} | {support_text} |",
-            f"| 시나리오 무효 가격 | {usd(daily.invalidation_price)} | {invalidation_text} |",
-            f"| 첫 저항·목표 후보 | {usd(daily.first_target_price)} | {target_text} |",
+            f"| 분석 기준 종가 | {usd(daily.close)} | {daily.data_timestamp} 완료 일봉; 등급과 가격 기준의 계산값입니다. |",
+            f"| 관찰 기준가 | {usd(daily.watch_price)} | {support_text} |",
+            f"| 하락 경계가 | {usd(daily.invalidation_price)} | {invalidation_text} |",
+            f"| 첫 저항가 | {usd(daily.first_target_price)} | {target_text} |",
             "",
             "## 거래량·큰 흐름",
             "",
             f"- 거래량: {_volume_text(daily.volume_ratio)}",
             f"- 변동성: ATR(14) {daily.atr14_pct:.2f}% · 분석 완료 캔들 {daily.candle_range_atr:.2f} ATR",
             f"- 추세 강도: ADX(14) {daily.adx14:.1f} · +DI {daily.plus_di14:.1f} / -DI {daily.minus_di14:.1f}",
-            f"- 첫 저항까지 손익비: {daily.reward_risk_ratio:.2f}:1 (실제 저항이 없으면 0으로 보수적 표시)",
-            "- 거래량·손익비는 분석 완료 일봉 기준이며 이후 현재가 변동을 반영하지 않습니다.",
+            "- 거래량·기술지표는 분석 완료 일봉 기준이며 이후 현재가 변동을 반영하지 않습니다.",
             f"- 최근 20일 평균 거래대금: {compact_money(daily.avg_trade_value_20)}",
             f"- 주봉: {daily.higher_timeframe}",
             f"- 미국 시장: {daily.market_context}",
@@ -260,6 +319,8 @@ def render_scan_report(
         "",
         f"> **결론: 관심 후보 {len(interests)}개 · 기다릴 종목 {len(waits)}개 · 피할 종목 {len(avoids)}개**",
         "> ETF·ETN·워런트·우선주·스팩과 유동성 부족 종목은 관심 후보에서 제외했습니다.",
+        "",
+        "> **가격 기준 읽는 법:** 관찰 기준 = 흐름을 확인할 가격 · 하락 경계 = 상승 시나리오가 깨지는 가격 · 첫 저항 = 위에서 막힐 수 있는 가격",
         "",
         "## 1. 먼저 볼 관심 후보",
         "",
@@ -353,30 +414,31 @@ def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> l
     if not items:
         return [empty]
     lines = [
-        "| 종목 | 등급 | 지금 할 일 | 손익비/ADX | 확인/무효/목표 | 과거 지표 일치 10일 | 평균 거래대금 | 분석 일봉 종가 · 데이터 범위 |",
-        "|---|:---:|---|---|---|---|---:|---|",
+        "| 종목 | 등급 | 판단 | 가격 기준 | 과거 유사 패턴 | 평균 거래대금 | 기준 일봉 · 데이터 |",
+        "|---|:---:|---|---|---|---:|---|",
     ]
     for item in items[:limit]:
         daily = item.daily
         similarity = item.similarity
         past = (
-            f"{similarity.up_count}/{similarity.sample_count} 상승 ({similarity.up_rate:.1f}%)"
+            f"{similarity.sample_count}건 중 {similarity.up_count}건 상승"
             if similarity.up_rate is not None
             else "표본 부족"
         )
-        if similarity.sample_count:
-            past += f" · {similarity.match_level}"
-            if similarity.invalidation_rate is not None:
-                past += f" · 구조선 이탈 {similarity.invalidation_rate:.1f}%"
+        if similarity.sample_count and similarity.expected_return_pct is not None:
+            past += f" · 평균 {similarity.expected_return_pct:+.2f}%"
         action = daily.action.replace("|", "/")
         if not item.liquid:
             action = f"유동성 부족: {item.liquidity_reason}"
-        levels = f"{usd(daily.watch_price)} / {usd(daily.invalidation_price)} / {usd(daily.first_target_price)}"
-        quality = f"{daily.reward_risk_ratio:.2f}:1 / {daily.adx14:.1f}"
+        levels = (
+            f"관찰 기준 {usd(daily.watch_price)} · "
+            f"하락 경계 {usd(daily.invalidation_price)} · "
+            f"첫 저항 {usd(daily.first_target_price)}"
+        )
         cells = (
             f"{item.stock.display_name} ({item.stock.symbol})", daily.grade, action,
-            quality, levels, past, compact_money(daily.avg_trade_value_20),
-            f"{usd(daily.close)} · {daily.source_range}",
+            levels, past, compact_money(daily.avg_trade_value_20),
+            f"종가 {usd(daily.close)} · {daily.source_range}",
         )
         lines.append("| " + " | ".join(_table_cell(cell) for cell in cells) + " |")
     if len(items) > limit:
@@ -468,6 +530,124 @@ def _table_cell(text: object) -> str:
     return " ".join(str(text).replace("|", "｜").split())
 
 
+def _table_cell_class(header: str) -> str:
+    normalized = " ".join(header.split())
+    if normalized == "종목":
+        return "cell-stock"
+    if normalized == "시장":
+        return "cell-market"
+    if normalized == "등급":
+        return "cell-grade"
+    if "지금 할 일" in normalized or normalized == "판단":
+        return "cell-action"
+    if "손익비" in normalized or normalized == "ADX":
+        return "cell-quality"
+    if "확인/무효/목표" in normalized or "가격" == normalized or normalized == "가격 기준":
+        return "cell-levels"
+    if "과거" in normalized:
+        return "cell-history"
+    if "거래대금" in normalized:
+        return "cell-money"
+    if "데이터 범위" in normalized or "분석 일봉" in normalized or "기준 일봉" in normalized:
+        return "cell-range"
+    return ""
+
+
+def _grade_html(text: str) -> str | None:
+    value = text.strip().upper()
+    mapping = {
+        "A+": "grade-aplus",
+        "A": "grade-a",
+        "B": "grade-b",
+        "C": "grade-c",
+        "D": "grade-d",
+    }
+    css_class = mapping.get(value)
+    if css_class is None:
+        return None
+    return f'<span class="grade-badge {css_class}">{escape(text.strip())}</span>'
+
+
+def _status_html(text: str) -> str:
+    cleaned = " ".join(text.split())
+    statuses = (
+        ("관심 후보", "status-good"),
+        ("기다림", "status-wait"),
+        ("피하기", "status-avoid"),
+        ("유동성 부족", "status-avoid"),
+    )
+    for label, css_class in statuses:
+        if cleaned.startswith(label):
+            detail = cleaned[len(label) :].strip()
+            detail = re.sub(r"^[-:·]\s*", "", detail)
+            detail_html = (
+                f'<span class="status-detail">{_inline_markdown(detail)}</span>' if detail else ""
+            )
+            return f'<span class="status-badge {css_class}">{escape(label)}</span>{detail_html}'
+    return _inline_markdown(cleaned)
+
+
+def _table_cell_html(header: str, text: str) -> str:
+    normalized = " ".join(header.split())
+    if normalized == "종목":
+        market = re.fullmatch(r"(.+?)\s*·\s*(KOSPI|KOSDAQ)", text.strip())
+        if market is not None:
+            return (
+                f'{_inline_markdown(market.group(1))}'
+                f'<span class="stock-market">{escape(market.group(2))}</span>'
+            )
+    if normalized == "등급":
+        grade = _grade_html(text)
+        if grade is not None:
+            return grade
+    if "지금 할 일" in normalized or normalized == "판단":
+        return _status_html(text)
+    if normalized == "가격 기준":
+        parts = [part.strip() for part in text.split("·") if part.strip()]
+        labels = ("관찰 기준", "하락 경계", "첫 저항")
+        rows: list[str] = []
+        for part in parts:
+            for label in labels:
+                if part.startswith(label):
+                    value = part[len(label) :].strip()
+                    rows.append(
+                        f'<div class="price-line"><span>{escape(label)}</span>'
+                        f'<strong>{_inline_markdown(value)}</strong></div>'
+                    )
+                    break
+            else:
+                rows.append(f'<div class="price-line">{_inline_markdown(part)}</div>')
+        if rows:
+            return "".join(rows)
+    return _inline_markdown(text)
+
+
+def _scan_summary_html(quote_lines: list[str]) -> str | None:
+    if not quote_lines:
+        return None
+    raw = re.sub(r"\*\*", "", quote_lines[0]).strip()
+    match = re.fullmatch(
+        r"결론:\s*관심 후보\s*(\d+)개\s*·\s*기다릴 종목\s*(\d+)개\s*·\s*피할 종목\s*(\d+)개",
+        raw,
+    )
+    if match is None:
+        return None
+    interest, wait, avoid = match.groups()
+    note = " ".join(quote_lines[1:]).strip()
+    note_html = (
+        f'<p class="summary-note">{_inline_markdown(note)}</p>'
+        if note
+        else ""
+    )
+    return (
+        '<section class="scan-summary" aria-label="전체 분석 요약">'
+        f'<div class="summary-metric good"><span>관심 후보</span><strong>{interest}</strong><em>종목</em></div>'
+        f'<div class="summary-metric wait"><span>기다릴 종목</span><strong>{wait}</strong><em>종목</em></div>'
+        f'<div class="summary-metric avoid"><span>피할 종목</span><strong>{avoid}</strong><em>종목</em></div>'
+        f"{note_html}</section>"
+    )
+
+
 def _is_table_separator(line: str) -> bool:
     cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
     return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
@@ -496,6 +676,10 @@ def _markdown_blocks(markdown: str) -> str:
             while index < len(lines) and lines[index].strip().startswith(">"):
                 quote_lines.append(lines[index].strip()[1:].strip())
                 index += 1
+            scan_summary = _scan_summary_html(quote_lines)
+            if scan_summary is not None:
+                output.append(scan_summary)
+                continue
             content = "".join(f"<p>{_inline_markdown(item)}</p>" for item in quote_lines)
             output.append(f"<blockquote>{content}</blockquote>")
             continue
@@ -515,15 +699,17 @@ def _markdown_blocks(markdown: str) -> str:
             row_html = "".join(
                 "<tr>"
                 + "".join(
-                    f'<td data-label="{escape(headers[position] if position < len(headers) else "")}">'
-                    f"{_inline_markdown(cell)}</td>"
+                    f'<td class="{_table_cell_class(headers[position] if position < len(headers) else "")}" '
+                    f'data-label="{escape(headers[position] if position < len(headers) else "")}">'
+                    f"{_table_cell_html(headers[position] if position < len(headers) else '', cell)}</td>"
                     for position, cell in enumerate(row)
                 )
                 + "</tr>"
                 for row in rows
             )
+            wrapper_class = "table-wrap wide" if len(headers) >= 6 else "table-wrap"
             output.append(
-                f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead>'
+                f'<div class="{wrapper_class}"><table><thead><tr>{head}</tr></thead>'
                 f"<tbody>{row_html}</tbody></table></div>"
             )
             continue

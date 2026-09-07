@@ -150,6 +150,21 @@ def test_paging_reports_truncation_but_allows_an_explicit_row_limit(monkeypatch)
     assert client.paged("usa06012", "/chart", {}, list_key="rows", max_pages=1, max_rows=1) == [{"id": 1}]
 
 
+def test_us_ranking_page_limit_scales_with_requested_rows(monkeypatch) -> None:
+    client = KiwoomRestClient(KiwoomCredentials("app", "secret"))
+    captured = {}
+
+    def fake_paged(api_id, path, body, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(client, "paged", fake_paged)
+    client.ranking("usa20550", max_rows=440)
+
+    assert captured["max_rows"] == 440
+    assert captured["max_pages"] >= 22
+
+
 def test_us_and_domestic_clients_share_query_spacing() -> None:
     from core.domestic_kiwoom_rest import DomesticKiwoomRestClient
 

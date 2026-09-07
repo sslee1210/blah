@@ -22,6 +22,7 @@ US_EASTERN = ZoneInfo("America/New_York")
 KOREA = ZoneInfo("Asia/Seoul")
 EXCHANGE_NAMES = {"ND": "NASDAQ", "NY": "NYSE", "NA": "AMEX"}
 EXCHANGE_RANK_CODES = {"NY": "1", "ND": "2", "NA": "3"}
+US_RANKING_PAGE_SIZE = 20
 REGULAR_SESSION_CLOSE_MINUTE = 16 * 60
 MAX_DAILY_SESSION_LAG_DAYS = 4
 MAX_MINUTE_DATA_AGE_DAYS = 7
@@ -468,12 +469,18 @@ class KiwoomRestClient:
         }
         if api_id == "usa20530":
             body["qry_tp"] = "1"
+        # Kiwoom's US ranking TRs currently return 20 rows per page.  The
+        # full-market scan asks for up to twice the configured scan size, so a
+        # fixed five-page cap truncates every request above 100 rows.  Size the
+        # safety cap from the requested row count and keep a small margin for
+        # provider-side short pages.
+        max_pages = max(5, math.ceil(max(1, max_rows) / US_RANKING_PAGE_SIZE) + 2)
         return self.paged(
             api_id,
             "/api/us/rkinfo",
             body,
             list_key="result_list",
-            max_pages=5,
+            max_pages=max_pages,
             max_rows=max_rows,
         )
 

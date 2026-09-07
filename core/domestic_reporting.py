@@ -82,18 +82,17 @@ def render_domestic_individual_report(result: AnalyzedStock) -> str:
             "| 항목 | 가격 | 쉬운 뜻 |",
             "|---|---:|---|",
             f"| {price_label} | {krw(live_price)} | {price_context} |",
-            f"| 분석 기준 종가 | {krw(daily.close)} | {daily.data_timestamp} 완료 일봉; 등급·손익비·가격 기준의 계산값입니다. |",
-            f"| 확인할 가격 | {krw(daily.watch_price)} | {watch_text} |",
-            f"| 시나리오 무효 가격 | {krw(daily.invalidation_price)} | 일봉 종가가 이 아래면 현재 상승 시나리오를 폐기합니다. |",
-            f"| 첫 저항·목표 후보 | {krw(daily.first_target_price)} | {target_text} |",
+            f"| 분석 기준 종가 | {krw(daily.close)} | {daily.data_timestamp} 완료 일봉; 등급과 가격 기준의 계산값입니다. |",
+            f"| 관찰 기준가 | {krw(daily.watch_price)} | {watch_text} |",
+            f"| 하락 경계가 | {krw(daily.invalidation_price)} | 일봉 종가가 이 아래면 현재 상승 시나리오를 폐기합니다. |",
+            f"| 첫 저항가 | {krw(daily.first_target_price)} | {target_text} |",
             "",
             "## 거래량·큰 흐름",
             "",
             f"- 거래량: {_volume_text(daily.volume_ratio)}",
             f"- 변동성: ATR(14) {daily.atr14_pct:.2f}% · 분석 완료 캔들 {daily.candle_range_atr:.2f} ATR",
             f"- 추세 강도: ADX(14) {daily.adx14:.1f} · +DI {daily.plus_di14:.1f} / -DI {daily.minus_di14:.1f}",
-            f"- 첫 저항까지 손익비: {daily.reward_risk_ratio:.2f}:1",
-            "- 거래량·손익비는 분석 완료 일봉 기준이며 이후 현재가 변동을 반영하지 않습니다.",
+            "- 거래량·기술지표는 분석 완료 일봉 기준이며 이후 현재가 변동을 반영하지 않습니다.",
             f"- 최근 20일 평균 거래대금: {compact_krw(daily.avg_trade_value_20)}",
             f"- 주봉: {daily.higher_timeframe}",
             f"- 국내 시장: {daily.market_context}",
@@ -160,6 +159,8 @@ def render_domestic_scan_report(
         f"> **결론: 관심 후보 {len(interests)}개 · 기다릴 종목 {len(waits)}개 · 피할 종목 {len(avoids)}개**",
         "> KOSPI·KOSDAQ 거래대금 상위에서 우선주·스팩·관리/경고 종목과 유동성 부족 종목을 제외했습니다.",
         "",
+        "> **가격 기준 읽는 법:** 관찰 기준 = 흐름을 확인할 가격 · 하락 경계 = 상승 시나리오가 깨지는 가격 · 첫 저항 = 위에서 막힐 수 있는 가격",
+        "",
         "## 1. 먼저 볼 관심 후보",
         "",
     ]
@@ -185,7 +186,7 @@ def render_domestic_scan_report(
             "- 가격 통화/기준 시간대: KRW / Asia/Seoul (한국시간)",
             "- 선별 방식: KOSPI·KOSDAQ 거래대금 상위의 합집합을 시장·업종별로 분산",
             "- 일목 파라미터: 9, 26, 52 / 일봉 주 분석 + 주봉 확인",
-            "- 보조지표: ATR(14), ADX/+DI/-DI, 거래량, 구조 손익비, 과거 유사패턴",
+            "- 보조지표: ATR(14), ADX/+DI/-DI, 거래량, 과거 유사패턴",
             "- 데이터 출처: 키움 REST API 국내주식",
             "- 전체 수치는 같은 폴더의 `all_results.csv`에 저장됩니다.",
         ]
@@ -238,28 +239,31 @@ def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> l
     if not items:
         return [empty]
     lines = [
-        "| 종목 | 시장 | 등급 | 지금 할 일 | 손익비/ADX | 확인/무효/목표 | 과거 10일 | 평균 거래대금 | 분석 일봉 종가 · 데이터 범위 |",
-        "|---|:---:|:---:|---|---|---|---|---:|---|",
+        "| 종목 | 등급 | 판단 | 가격 기준 | 과거 유사 패턴 | 평균 거래대금 | 기준 일봉 · 데이터 |",
+        "|---|:---:|---|---|---|---:|---|",
     ]
     for item in items[:limit]:
         daily = item.daily
         similarity = item.similarity
         past = (
-            f"{similarity.up_count}/{similarity.sample_count} 상승 ({similarity.up_rate:.1f}%)"
+            f"{similarity.sample_count}건 중 {similarity.up_count}건 상승"
             if similarity.up_rate is not None
             else "표본 부족"
         )
         if similarity.sample_count and similarity.expected_return_pct is not None:
-            past += f" · 표본 평균 {similarity.expected_return_pct:+.2f}%"
+            past += f" · 평균 {similarity.expected_return_pct:+.2f}%"
         action = daily.action.replace("|", "/")
         if not item.liquid:
             action = f"유동성 부족: {item.liquidity_reason}"
-        quality = f"{daily.reward_risk_ratio:.2f}:1 / {daily.adx14:.1f}"
-        levels = f"{krw(daily.watch_price)} / {krw(daily.invalidation_price)} / {krw(daily.first_target_price)}"
+        levels = (
+            f"관찰 기준 {krw(daily.watch_price)} · "
+            f"하락 경계 {krw(daily.invalidation_price)} · "
+            f"첫 저항 {krw(daily.first_target_price)}"
+        )
         cells = (
-            f"{item.stock.display_name} ({item.stock.symbol})", item.stock.exchange,
-            daily.grade, action, quality, levels, past, compact_krw(daily.avg_trade_value_20),
-            f"{krw(daily.close)} · {daily.source_range}",
+            f"{item.stock.display_name} ({item.stock.symbol}) · {item.stock.exchange}",
+            daily.grade, action, levels, past, compact_krw(daily.avg_trade_value_20),
+            f"종가 {krw(daily.close)} · {daily.source_range}",
         )
         lines.append("| " + " | ".join(_table_cell(cell) for cell in cells) + " |")
     if len(items) > limit:

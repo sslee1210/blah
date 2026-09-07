@@ -48,8 +48,8 @@ def test_report_uses_beginner_price_labels_and_probability_warning() -> None:
     )
     report = render_individual_report(result)
     assert "지금 할 일" in report
-    assert "시나리오 무효 가격" in report
-    assert "첫 저항·목표 후보" in report
+    assert "하락 경계가" in report
+    assert "첫 저항가" in report
     assert "표본 조건: 엄격 일치" in report
     assert "구조 지지선 선행 이탈" in report
     assert "미래 상승 확률이나 수익을 보장하지 않습니다" in report
@@ -72,10 +72,30 @@ def test_html_report_is_standalone_responsive_and_escapes_content() -> None:
     assert "A&amp;B &lt;분석&gt;" in report
     assert "<table>" in report
     assert 'data-label="항목"' in report
-    assert "table-layout:fixed" in report
+    assert "table-layout:auto" in report
+    assert "overflow-x:auto" in report
     assert "content:attr(data-label)" in report
     assert "<strong>지금 할 일: 기다림</strong>" in report
     assert "<script" not in report
+
+
+def test_scan_html_promotes_summary_and_statuses_to_visual_badges() -> None:
+    markdown = """# 전체 분석
+
+> **결론: 관심 후보 3개 · 기다릴 종목 7개 · 피할 종목 11개**
+> 유동성 부족 종목은 관심 후보에서 제외했습니다.
+
+| 종목 | 등급 | 판단 | 가격 기준 | 과거 유사 패턴 | 평균 거래대금 | 기준 일봉 · 데이터 |
+|---|:---:|---|---|---|---:|---|
+| 테스트 (TEST) | A+ | 관심 후보 - 지지 확인 후 판단 | 관찰 기준 $10 · 하락 경계 $9 · 첫 저항 $12 | 7/10 상승 | $1.0B | 종가 $10 · 2026-01-01 ~ 2026-09-01 |
+"""
+    report = render_html_report(markdown, title="전체 분석")
+    assert 'class="scan-summary"' in report
+    assert '<strong>3</strong><em>종목</em>' in report
+    assert 'class="grade-badge grade-aplus"' in report
+    assert 'class="status-badge status-good"' in report
+    assert 'class="table-wrap wide"' in report
+    assert 'class="price-line"' in report
 
 
 def test_liquidity_blocks_small_dollar_volume() -> None:
@@ -134,7 +154,7 @@ def test_reports_do_not_label_fallback_daily_close_as_a_current_quote(renderer) 
     assert "현재가를 조회한 값이 아닙니다" in report
     assert "최근 조회 가격" not in report
     assert "분석 기준 종가" in report
-    assert "거래량·손익비는 분석 완료 일봉 기준" in report
+    assert "거래량·기술지표는 분석 완료 일봉 기준" in report
     assert "하루 기준으로 환산" not in report
     assert "과거 표본 내 결과: 0건 · 분석 기간 부족" in report
 
@@ -163,13 +183,13 @@ def test_reports_do_not_invent_a_target_without_resistance(renderer) -> None:
     result = _report_fixture()
     result = replace(result, daily=replace(result.daily, first_target_price=None))
     report = renderer(result)
-    assert "첫 저항·목표 후보 | 확인 불가" in report
+    assert "첫 저항가 | 확인 불가" in report
     assert "목표 가격을 제시하지 않습니다" in report
 
 
 @pytest.mark.parametrize(
     "renderer,timezone_name,cells",
-    [(render_scan_report, "America/New_York", 8), (render_domestic_scan_report, "Asia/Seoul", 9)],
+    [(render_scan_report, "America/New_York", 7), (render_domestic_scan_report, "Asia/Seoul", 7)],
 )
 def test_scan_reports_preserve_columns_and_include_data_provenance(renderer, timezone_name, cells) -> None:
     result = _report_fixture()
@@ -178,7 +198,7 @@ def test_scan_reports_preserve_columns_and_include_data_provenance(renderer, tim
     report = renderer([result], started_at=moment, finished_at=moment, universe_stats={}, failures=[])
     assert timezone_name in report
     assert result.daily.source_range in report
-    assert "분석 일봉 종가" in report
+    assert "기준 일봉 · 데이터" in report
     html = render_html_report(report, title="표 테스트")
     assert "<script>" not in html
     assert "A｜B &lt;script&gt;bad()&lt;/script&gt;" in html
