@@ -30,6 +30,25 @@ def test_signed_kiwoom_prices_are_treated_as_absolute_prices() -> None:
     assert number("", absolute=True) is None
 
 
+@pytest.mark.parametrize("parser", [_daily_frame, _minute_frame])
+@pytest.mark.parametrize("problem", ["date", "missing_price", "invalid_range"])
+def test_malformed_us_bars_are_not_silently_removed(parser, problem) -> None:
+    row = {
+        "dt": "20260902", "cntr_tm": "20260902100000", "bus_dt": "20260902",
+        "open_pric": "10", "high_pric": "11", "low_pric": "9", "cur_prc": "10.5",
+        "acc_trde_qty": "100", "trde_qty": "100",
+    }
+    bad = dict(row)
+    if problem == "date":
+        bad["dt"] = bad["cntr_tm"] = "invalid"
+    elif problem == "missing_price":
+        bad["cur_prc"] = ""
+    else:
+        bad["high_pric"] = "1"
+    with pytest.raises(KiwoomRestError, match="OHLCV"):
+        parser([row, bad])
+
+
 def test_daily_response_is_sorted_and_deduplicated() -> None:
     rows = [
         {"dt": "20260103", "open_pric": "-10", "high_pric": "11", "low_pric": "9", "cur_prc": "10.5", "acc_trde_qty": "100"},

@@ -35,6 +35,7 @@ from core.domestic_storage import DomesticCacheStore
 from core.domestic_universe import DomesticUniverseCandidate, build_domestic_scan_universe
 from core.ichimoku import MIN_BARS, IchimokuReading, analyze_ichimoku, resample_weekly
 from core.kiwoom_rest import InvalidSecurityError, KiwoomRestError, StockInfo
+from core.market_intelligence import MarketIntelligenceService
 from core.reporting import AnalyzedStock, render_html_report
 from core.similarity import summarize_similarity
 
@@ -45,6 +46,7 @@ CACHE_DIR = Path(os.getenv("REAL_KR_CACHE_DIR", ROOT / ".domestic_ichimoku_cache
 REPORTS_DIR = Path(os.getenv("REAL_KR_REPORTS_DIR", ROOT / "reports"))
 CREDENTIAL_PATH = RUNTIME_DIR / "kiwoom_rest_credentials.dat"
 LOCK_PATH = RUNTIME_DIR / "analyzer.lock"
+INTELLIGENCE_CACHE_PATH = RUNTIME_DIR / "market_intelligence_cache.json"
 SCAN_SIZE = max(50, min(400, int(os.getenv("REAL_KR_SCAN_SIZE", "160"))))
 SCAN_WORKERS = max(1, min(12, int(os.getenv("REAL_KR_SCAN_WORKERS", "6"))))
 MIN_AVG_VOLUME = max(0.0, float(os.getenv("REAL_KR_MIN_AVG_VOLUME", "100000")))
@@ -60,10 +62,16 @@ class IncompleteDomesticScanError(KiwoomRestError):
 
 
 class DomesticStockAnalyzer:
-    def __init__(self, client: DomesticKiwoomRestClient, cache: DomesticCacheStore) -> None:
+    def __init__(
+        self,
+        client: DomesticKiwoomRestClient,
+        cache: DomesticCacheStore,
+        intelligence: MarketIntelligenceService | None = None,
+    ) -> None:
         self.client = client
         self.cache = cache
         self._master: list[StockInfo] | None = None
+        self.intelligence = intelligence or MarketIntelligenceService(INTELLIGENCE_CACHE_PATH)
 
     def master(self, *, allow_network: bool = True) -> list[StockInfo]:
         if self._master is not None:
@@ -144,6 +152,7 @@ class DomesticStockAnalyzer:
     def analyze_individual(self, text: str) -> tuple[AnalyzedStock, Path]:
         stock = self.resolve_stock(text)
         market_label, market_weak = self.market_context()
+        market_intelligence = self.intelligence.market_overview("KR")
         result = self._analyze_stock(
             stock,
             market_label=market_label,
@@ -151,6 +160,14 @@ class DomesticStockAnalyzer:
             include_quote=True,
             include_intraday=True,
         )
+        stock_intelligence = self.intelligence.stock_overview(
+            market="KR",
+            symbol=stock.symbol,
+            name=stock.display_name,
+            sector=stock.sector,
+            base=market_intelligence,
+        )
+        result = replace(result, intelligence=stock_intelligence or market_intelligence)
         now = datetime.now(KOREA)
         folder = REPORTS_DIR / f"국내_{stock.symbol}_{now:%Y%m%d_%H%M%S}"
         folder.mkdir(parents=True, exist_ok=True)
@@ -174,6 +191,9 @@ class DomesticStockAnalyzer:
         master = self.master()
         market_label, market_weak = self.market_context()
         print(f"[시장 확인] {market_label}")
+        market_intelligence = self.intelligence.market_overview("KR")
+        if market_intelligence is not None:
+            print(f"[시장·뉴스] {market_intelligence.one_line}")
         candidates, stats = build_domestic_scan_universe(
             self.client,
             master,
@@ -252,6 +272,8 @@ class DomesticStockAnalyzer:
                 "일목 분석 대상에서 제외했습니다."
             )
 
+        if market_intelligence is not None:
+            results = [replace(item, intelligence=market_intelligence) for item in results]
         finished = datetime.now(KOREA)
         folder = REPORTS_DIR / f"전체_국내주식_{finished:%Y%m%d_%H%M%S}"
         folder.mkdir(parents=True, exist_ok=True)
@@ -261,6 +283,7 @@ class DomesticStockAnalyzer:
             finished_at=finished,
             universe_stats=stats,
             failures=failures,
+            intelligence=market_intelligence,
         )
         md_path = folder / "report.md"
         md_path.write_text(markdown, encoding="utf-8")
@@ -497,6 +520,14 @@ def _write_scan_csv(path: Path, results: list[AnalyzedStock]) -> None:
                 "similar_invalidation_rate": similarity.invalidation_rate,
                 "weekly_context": daily.higher_timeframe,
                 "market_context": daily.market_context,
+                "technical_score": item.technical_score,
+                "context_adjusted_score": item.context_adjusted_score,
+                "final_action": item.final_action,
+                "intelligence_score": item.intelligence.score if item.intelligence else None,
+                "intelligence_label": item.intelligence.label if item.intelligence else "",
+                "intelligence_market_score": item.intelligence.market_score if item.intelligence else None,
+                "intelligence_news_score": item.intelligence.news_score if item.intelligence else None,
+                "intelligence_event_risk": item.intelligence.event_risk if item.intelligence else None,
                 "timeframe": daily.timeframe,
                 "ichimoku_parameters": "9,26,52",
                 "data_source": "키움 REST API 국내주식 ka10081 수정주가 일봉",
@@ -597,14 +628,7 @@ def run_command(analyzer: DomesticStockAnalyzer, command: str) -> bool:
         "국내 주식 전체 분석해줘",
     }:
         results, failures, path, _ = analyzer.analyze_all()
-        interest_count = sum(
-            item.liquid
-            and item.daily.grade in {"A+", "A"}
-            and not item.daily.hard_blocks
-            and item.daily.higher_timeframe == "주봉도 상승 방향"
-            and "모두 상승" in item.daily.market_context
-            for item in results
-        )
+        interest_count = sum(item.is_interest for item in results)
         print(
             f"\n완료: {len(results):,}개 분석 · 관심 후보 {interest_count:,}개 · 오류 {len(failures):,}개"
         )

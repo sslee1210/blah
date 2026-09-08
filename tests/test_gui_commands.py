@@ -152,3 +152,15 @@ def test_gui_handles_credential_file_write_error(monkeypatch) -> None:
 
     assert not StockAnalyzerApp._ensure_credentials(app)
     showerror.assert_called_once()
+
+
+@pytest.mark.parametrize("variable", ["REAL2_REPORTS_DIR", "REAL_KR_REPORTS_DIR"])
+def test_gui_accepts_explicitly_configured_report_folders(tmp_path, monkeypatch, variable) -> None:
+    app_root = tmp_path / "app"
+    reports = tmp_path / "custom_reports"
+    reports.mkdir()
+    report = reports / "report.html"
+    report.write_text("test report", encoding="utf-8")
+    monkeypatch.setattr(gui, "ROOT", app_root)
+    monkeypatch.setenv(variable, str(reports))
+    assert StockAnalyzerApp._extract_report_path(f"HTML 보고서: {report}") == report

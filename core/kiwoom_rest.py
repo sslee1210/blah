@@ -488,6 +488,8 @@ class KiwoomRestClient:
 def _daily_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     for row in rows:
+        if not isinstance(row, dict):
+            raise KiwoomRestError("미국 차트 OHLCV 응답 형식이 올바르지 않습니다.")
         timestamp = pd.to_datetime(str(row.get("dt", "")), format="%Y%m%d", errors="coerce")
         values = {
             "timestamp": timestamp,
@@ -498,8 +500,8 @@ def _daily_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
             "volume": number(row.get("acc_trde_qty"), absolute=True),
             "trade_value": number(row.get("acc_trde_prica"), absolute=True),
         }
-        if pd.notna(timestamp) and all(values[key] is not None for key in ("open", "high", "low", "close")):
-            records.append(values)
+        _validate_us_bar(values)
+        records.append(values)
     if not records:
         return pd.DataFrame(
             columns=["open", "high", "low", "close", "volume", "trade_value"],
@@ -511,6 +513,14 @@ def _daily_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
     calculated_value = frame["close"] * frame["volume"]
     frame["trade_value"] = pd.to_numeric(frame["trade_value"], errors="coerce").fillna(calculated_value)
     return frame.astype(float)
+
+
+def _validate_us_bar(values: dict[str, Any]) -> None:
+    prices = [values[key] for key in ("open", "high", "low", "close")]
+    if pd.isna(values["timestamp"]) or any(value is None or value <= 0 for value in prices):
+        raise KiwoomRestError("미국 차트 OHLCV 날짜 또는 가격이 비어 있거나 올바르지 않습니다.")
+    if values["high"] < max(prices) or values["low"] > min(prices):
+        raise KiwoomRestError("미국 차트 OHLCV 고가·저가와 시가·종가의 관계가 올바르지 않습니다.")
 
 
 def latest_completed_us_weekday(now: datetime | None = None) -> date:
@@ -582,6 +592,8 @@ def _eastern_datetime(value: datetime | None) -> datetime:
 def _minute_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
     records: list[dict[str, Any]] = []
     for row in rows:
+        if not isinstance(row, dict):
+            raise KiwoomRestError("미국 차트 OHLCV 응답 형식이 올바르지 않습니다.")
         timestamp = _parse_us_chart_time(row.get("cntr_tm"), row.get("bus_dt"))
         values = {
             "timestamp": timestamp,
@@ -591,8 +603,8 @@ def _minute_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
             "close": number(row.get("cur_prc"), absolute=True),
             "volume": number(row.get("trde_qty"), absolute=True),
         }
-        if pd.notna(timestamp) and all(values[key] is not None for key in ("open", "high", "low", "close")):
-            records.append(values)
+        _validate_us_bar(values)
+        records.append(values)
     if not records:
         return pd.DataFrame(
             columns=["open", "high", "low", "close", "volume"],

@@ -472,8 +472,14 @@ class StockAnalyzerApp(tk.Tk):
                 if not candidate.is_absolute():
                     candidate = ROOT / candidate
                 candidate = candidate.resolve()
+                report_roots = [ROOT / "reports"]
+                for variable in ("REAL2_REPORTS_DIR", "REAL_KR_REPORTS_DIR"):
+                    configured = os.getenv(variable, "").strip()
+                    if configured:
+                        folder = Path(configured)
+                        report_roots.append(folder if folder.is_absolute() else ROOT / folder)
                 if (
-                    candidate.is_relative_to((ROOT / "reports").resolve())
+                    any(candidate.is_relative_to(folder.resolve()) for folder in report_roots)
                     and candidate.suffix.lower() in {".html", ".md"}
                     and candidate.is_file()
                 ):

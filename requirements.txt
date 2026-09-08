@@ -1,5 +1,6 @@
 pandas>=2.2,<3
 numpy>=1.26,<3
 requests>=2.31,<3
+finance-datareader>=0.9.202,<1
 pytest>=8,<10
 

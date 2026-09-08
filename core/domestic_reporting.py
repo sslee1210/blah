@@ -7,7 +7,13 @@ from math import isfinite
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
-from .reporting import AnalyzedStock, _table_cell
+from .market_intelligence import MarketIntelligence
+from .reporting import (
+    AnalyzedStock,
+    _intelligence_lines,
+    _market_intelligence_summary_lines,
+    _table_cell,
+)
 from .similarity import SimilarityResult
 
 
@@ -63,8 +69,8 @@ def render_domestic_individual_report(result: AnalyzedStock) -> str:
     lines = [
         f"# {stock.display_name} ({stock.symbol}) 국내주식 분석",
         "",
-        f"> **지금 할 일: {daily.action}**",
-        f"> 일목 등급 {daily.grade} · 신뢰도 {daily.confidence} · {price_label} {krw(live_price)}",
+        f"> **지금 할 일: {result.final_action}**",
+        f"> 일목 등급 {daily.grade} · 신뢰도 {daily.confidence} · 보조 종합점수 {result.context_adjusted_score}/100 · {price_label} {krw(live_price)}",
         "",
         "## 왜 이렇게 봤나요?",
         "",
@@ -74,6 +80,7 @@ def render_domestic_individual_report(result: AnalyzedStock) -> str:
         lines.append(f"- **아직 기다리는 이유:** {' / '.join(blocks)}")
     if not result.liquid:
         lines.append(f"- **유동성 경고:** {result.liquidity_reason}")
+    lines.extend(_intelligence_lines(result.intelligence))
     lines.extend(
         [
             "",
@@ -144,6 +151,7 @@ def render_domestic_scan_report(
     finished_at: datetime,
     universe_stats: dict[str, int],
     failures: list[str],
+    intelligence: MarketIntelligence | None = None,
 ) -> str:
     values = list(results)
     interests = [item for item in values if _is_interest(item)]
@@ -158,12 +166,13 @@ def render_domestic_scan_report(
         "",
         f"> **결론: 관심 후보 {len(interests)}개 · 기다릴 종목 {len(waits)}개 · 피할 종목 {len(avoids)}개**",
         "> KOSPI·KOSDAQ 거래대금 상위에서 우선주·스팩·관리/경고 종목과 유동성 부족 종목을 제외했습니다.",
+        "> 등급과 표시 순서는 분석 규칙에 따른 분류이며, 전체 선별 전략의 수익성이 검증되었다는 뜻은 아닙니다.",
         "",
         "> **가격 기준 읽는 법:** 관찰 기준 = 흐름을 확인할 가격 · 하락 경계 = 상승 시나리오가 깨지는 가격 · 첫 저항 = 위에서 막힐 수 있는 가격",
         "",
-        "## 1. 먼저 볼 관심 후보",
-        "",
     ]
+    lines.extend(_market_intelligence_summary_lines(intelligence))
+    lines.extend(["", "## 1. 먼저 볼 관심 후보", ""])
     lines.extend(_scan_table(interests, empty="현재 조건을 모두 통과한 관심 후보가 없습니다."))
     lines.extend(["", "## 2. 차트는 일부 좋지만 기다릴 종목", ""])
     lines.extend(_scan_table(waits, empty="없음", limit=60))
@@ -204,13 +213,7 @@ def render_domestic_scan_report(
 
 
 def _is_interest(item: AnalyzedStock) -> bool:
-    return (
-        item.liquid
-        and item.daily.grade in {"A+", "A"}
-        and not item.daily.hard_blocks
-        and item.daily.higher_timeframe == "주봉도 상승 방향"
-        and "모두 상승" in item.daily.market_context
-    )
+    return item.is_interest
 
 
 def _sort_key(item: AnalyzedStock) -> tuple[int, int, float, float, float, float, float]:
@@ -252,7 +255,9 @@ def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> l
         )
         if similarity.sample_count and similarity.expected_return_pct is not None:
             past += f" · 평균 {similarity.expected_return_pct:+.2f}%"
-        action = daily.action.replace("|", "/")
+        if similarity.sample_count:
+            past += f" · {similarity.status}"
+        action = f"보조 {item.context_adjusted_score}/100 · {item.final_action}".replace("|", "/")
         if not item.liquid:
             action = f"유동성 부족: {item.liquidity_reason}"
         levels = (
@@ -262,7 +267,8 @@ def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> l
         )
         cells = (
             f"{item.stock.display_name} ({item.stock.symbol}) · {item.stock.exchange}",
-            daily.grade, action, levels, past, compact_krw(daily.avg_trade_value_20),
+            daily.grade, action, levels, past,
+            compact_krw(daily.avg_trade_value_20),
             f"종가 {krw(daily.close)} · {daily.source_range}",
         )
         lines.append("| " + " | ".join(_table_cell(cell) for cell in cells) + " |")

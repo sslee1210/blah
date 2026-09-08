@@ -32,6 +32,7 @@ from core.kiwoom_rest import (
     completed_us_minute_bars,
     regular_session_minute_bars,
 )
+from core.market_intelligence import MarketIntelligenceService
 from core.reporting import (
     AnalyzedStock,
     one_line,
@@ -51,6 +52,7 @@ CACHE_DIR = Path(os.getenv("REAL2_CACHE_DIR", ROOT / ".us_ichimoku_cache"))
 REPORTS_DIR = Path(os.getenv("REAL2_REPORTS_DIR", ROOT / "reports"))
 CREDENTIAL_PATH = RUNTIME_DIR / "kiwoom_rest_credentials.dat"
 LOCK_PATH = RUNTIME_DIR / "analyzer.lock"
+INTELLIGENCE_CACHE_PATH = RUNTIME_DIR / "market_intelligence_cache.json"
 US_EASTERN = ZoneInfo("America/New_York")
 SCAN_SIZE = max(50, min(500, int(os.getenv("REAL2_SCAN_SIZE", "220"))))
 SCAN_WORKERS = max(1, min(16, int(os.getenv("REAL2_SCAN_WORKERS", "8"))))
@@ -66,10 +68,16 @@ class PartialScanError(KiwoomRestError):
 
 
 class USStockAnalyzer:
-    def __init__(self, client: KiwoomRestClient, cache: CacheStore) -> None:
+    def __init__(
+        self,
+        client: KiwoomRestClient,
+        cache: CacheStore,
+        intelligence: MarketIntelligenceService | None = None,
+    ) -> None:
         self.client = client
         self.cache = cache
         self._master: list[StockInfo] | None = None
+        self.intelligence = intelligence or MarketIntelligenceService(INTELLIGENCE_CACHE_PATH)
 
     def master(self, *, allow_network: bool = True) -> list[StockInfo]:
         if self._master is not None:
@@ -182,6 +190,7 @@ class USStockAnalyzer:
     def analyze_individual(self, text: str) -> tuple[AnalyzedStock, Path]:
         stock = self.resolve_stock(text)
         market_label, market_weak = self.market_context()
+        market_intelligence = self.intelligence.market_overview("US")
         result = self._analyze_stock(
             stock,
             market_label=market_label,
@@ -190,6 +199,14 @@ class USStockAnalyzer:
             include_intraday=True,
             full_history=True,
         )
+        stock_intelligence = self.intelligence.stock_overview(
+            market="US",
+            symbol=stock.symbol,
+            name=stock.english_name or stock.display_name,
+            sector=stock.sector,
+            base=market_intelligence,
+        )
+        result = replace(result, intelligence=stock_intelligence or market_intelligence)
         now = datetime.now(US_EASTERN)
         folder = REPORTS_DIR / f"{stock.symbol}_{now:%Y%m%d_%H%M%S}"
         folder.mkdir(parents=True, exist_ok=True)
@@ -208,6 +225,9 @@ class USStockAnalyzer:
         master = self.master()
         market_label, market_weak = self.market_context()
         print(f"[시장 확인] {market_label}")
+        market_intelligence = self.intelligence.market_overview("US")
+        if market_intelligence is not None:
+            print(f"[시장·뉴스] {market_intelligence.one_line}")
         candidates, stats = build_scan_universe(
             self.client,
             master,
@@ -271,6 +291,8 @@ class USStockAnalyzer:
             if index % 10 == 0 or index == len(pending):
                 print(f"[자동 복구] {index}/{len(pending)} 재확인 완료")
 
+        if market_intelligence is not None:
+            results = [replace(item, intelligence=market_intelligence) for item in results]
         finished = datetime.now(US_EASTERN)
         folder = REPORTS_DIR / f"전체_미국주식_{finished:%Y%m%d_%H%M%S}"
         folder.mkdir(parents=True, exist_ok=True)
@@ -280,6 +302,7 @@ class USStockAnalyzer:
             finished_at=finished,
             universe_stats=stats,
             failures=final_failures,
+            intelligence=market_intelligence,
         )
         (folder / "report.md").write_text(markdown, encoding="utf-8")
         report_path = folder / "report.html"
@@ -503,6 +526,14 @@ def _write_scan_csv(path: Path, results: list[AnalyzedStock]) -> None:
                 "similar_payoff_ratio": similarity.payoff_ratio,
                 "weekly_context": daily.higher_timeframe,
                 "market_context": daily.market_context,
+                "technical_score": item.technical_score,
+                "context_adjusted_score": item.context_adjusted_score,
+                "final_action": item.final_action,
+                "intelligence_score": item.intelligence.score if item.intelligence else None,
+                "intelligence_label": item.intelligence.label if item.intelligence else "",
+                "intelligence_market_score": item.intelligence.market_score if item.intelligence else None,
+                "intelligence_news_score": item.intelligence.news_score if item.intelligence else None,
+                "intelligence_event_risk": item.intelligence.event_risk if item.intelligence else None,
                 "data_timestamp": daily.data_timestamp,
                 "source_range": daily.source_range,
                 "timeframe": daily.timeframe,
@@ -603,14 +634,7 @@ def run_command(
         return True
     if normalized in {"전체 분석해줘", "전체분석해줘", "미국 전체 분석해줘", "미국주식 전체 분석해줘"}:
         results, failures, path, _ = analyzer.analyze_all()
-        interest_count = sum(
-            item.liquid
-            and item.daily.grade in {"A+", "A"}
-            and not item.daily.hard_blocks
-            and item.daily.higher_timeframe == "주봉도 상승 방향"
-            and "모두 상승" in item.daily.market_context
-            for item in results
-        )
+        interest_count = sum(item.is_interest for item in results)
         print(f"\n완료: {len(results):,}개 분석 · 관심 후보 {interest_count:,}개 · 오류 {len(failures):,}개")
         print(f"HTML 보고서: {path}")
         print(f"Markdown 보고서: {path.with_suffix('.md')}\n")

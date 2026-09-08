@@ -211,3 +211,36 @@ def test_scan_reports_preserve_columns_and_include_data_provenance(renderer, tim
 @pytest.mark.parametrize("value", [None, float("nan"), float("inf")])
 def test_price_formatters_mark_unavailable_values(formatter, value) -> None:
     assert formatter(value) == "확인 불가"
+
+
+@pytest.mark.parametrize("market", ["us", "domestic"])
+@pytest.mark.parametrize("action,expected", [("기다림 - 조건 확인", 0), ("관심 후보 - 지지 확인", 1)])
+def test_scan_summary_and_console_follow_the_final_action(market, action, expected, tmp_path, capsys) -> None:
+    from types import SimpleNamespace
+    from us_ichimoku_analyzer import run_command as run_us
+    from domestic_stock_analyzer import run_command as run_domestic
+
+    result = _report_fixture()
+    result = replace(result, daily=replace(
+        result.daily, grade="A", hard_blocks=(), action=action,
+        higher_timeframe="주봉도 상승 방향",
+        market_context="SPY·QQQ 모두 상승 방향" if market == "us" else "KOSPI·KOSDAQ 모두 상승 방향",
+    ))
+    renderer = render_scan_report if market == "us" else render_domestic_scan_report
+    moment = datetime(2026, 9, 4, 14, tzinfo=timezone.utc)
+    report = renderer([result], started_at=moment, finished_at=moment, universe_stats={}, failures=[])
+    assert f"관심 후보 {expected}개 · 기다릴 종목 {1 - expected}개" in report
+    analyzer = SimpleNamespace(analyze_all=lambda: ([result], [], tmp_path / "report.html", {}))
+    runner = run_us if market == "us" else run_domestic
+    assert runner(analyzer, "전체 분석해줘")
+    assert f"관심 후보 {expected}개" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("renderer", [render_scan_report, render_domestic_scan_report])
+def test_scan_shows_small_sample_warning_beside_its_returns(renderer) -> None:
+    result = replace(_report_fixture(), similarity=SimilarityResult(
+        1, 1, 100.0, 5.0, 1, 1, 100.0, 0.2, "표본 적음", expected_return_pct=5.0,
+    ))
+    moment = datetime(2026, 9, 4, 14, tzinfo=timezone.utc)
+    report = renderer([result], started_at=moment, finished_at=moment, universe_stats={}, failures=[])
+    assert "1건 중 1건 상승 · 평균 +5.00% · 표본 적음" in report

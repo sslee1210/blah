@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from .ichimoku import IchimokuReading
 from .kiwoom_rest import Quote, StockInfo
+from .market_intelligence import MarketIntelligence
 from .similarity import SimilarityResult
 
 
@@ -24,6 +25,45 @@ class AnalyzedStock:
     intraday: IchimokuReading | None = None
     liquid: bool = True
     liquidity_reason: str = ""
+    intelligence: MarketIntelligence | None = None
+
+    @property
+    def technical_score(self) -> int:
+        base = {"A+": 90, "A": 80, "B": 65, "C": 45, "D": 25}.get(self.daily.grade, 50)
+        if self.daily.confidence == "높음":
+            base += 5
+        elif self.daily.confidence == "낮음":
+            base -= 5
+        if self.daily.hard_blocks:
+            base -= min(20, len(self.daily.hard_blocks) * 6)
+        return max(0, min(100, base))
+
+    @property
+    def context_adjusted_score(self) -> int:
+        if self.intelligence is None:
+            return self.technical_score
+        return round(self.technical_score * 0.65 + self.intelligence.score * 0.35)
+
+    @property
+    def final_action(self) -> str:
+        if self.intelligence is not None and self.daily.action.startswith("관심"):
+            if self.intelligence.event_risk is not None and self.intelligence.event_risk >= 75:
+                return "기다림 - 차트는 좋지만 글로벌 이벤트 위험이 높아 재확인"
+            if self.intelligence.score < 42:
+                return "기다림 - 차트는 좋지만 시장·뉴스 환경이 부담스러워 재확인"
+        return self.daily.action
+
+    @property
+    def is_interest(self) -> bool:
+        """Use the final analysis decision consistently in every scan output."""
+        return (
+            self.liquid
+            and self.final_action.startswith("관심")
+            and self.daily.grade in {"A+", "A"}
+            and not self.daily.hard_blocks
+            and self.daily.higher_timeframe == "주봉도 상승 방향"
+            and "모두 상승" in self.daily.market_context
+        )
 
 
 def render_html_report(
@@ -221,8 +261,8 @@ def render_individual_report(result: AnalyzedStock) -> str:
     lines = [
         f"# {stock.display_name} ({stock.symbol}) 미국주식 분석",
         "",
-        f"> **지금 할 일: {daily.action}**",
-        f"> 일목 등급 {daily.grade} · 신뢰도 {daily.confidence} · {price_label} {usd(live_price)}",
+        f"> **지금 할 일: {result.final_action}**",
+        f"> 일목 등급 {daily.grade} · 신뢰도 {daily.confidence} · 보조 종합점수 {result.context_adjusted_score}/100 · {price_label} {usd(live_price)}",
         "",
         "## 왜 이렇게 봤나요?",
         "",
@@ -232,6 +272,7 @@ def render_individual_report(result: AnalyzedStock) -> str:
         lines.append(f"- **아직 기다리는 이유:** {' / '.join(blocks)}")
     if not result.liquid:
         lines.append(f"- **유동성 경고:** {result.liquidity_reason}")
+    lines.extend(_intelligence_lines(result.intelligence))
     lines.extend(
         [
             "",
@@ -298,6 +339,65 @@ def render_individual_report(result: AnalyzedStock) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _intelligence_lines(intelligence: MarketIntelligence | None) -> list[str]:
+    lines = ["", "## 시장·뉴스 보조 분석", ""]
+    if intelligence is None:
+        return lines + ["- 외부 시장·뉴스 정보를 사용하지 못해 차트 분석만 표시합니다."]
+    lines.append(f"- **환경 점수: {intelligence.score}/100 · {intelligence.label}**")
+    if intelligence.market_score is not None:
+        lines.append(f"- 글로벌/시장 지표 점수: {intelligence.market_score}/100")
+    if intelligence.news_score is not None:
+        lines.append(f"- 최근 뉴스 점수: {intelligence.news_score}/100")
+    if intelligence.event_risk is not None:
+        lines.append(f"- 글로벌 이벤트 위험: {intelligence.event_risk}/100 (높을수록 부담)")
+    if intelligence.metrics:
+        lines.extend(["", "### 주요 시장 지표", "", "| 지표 | 1일 | 5일 | 해석 |", "|---|---:|---:|:---:|"])
+        for metric in intelligence.metrics:
+            lines.append(
+                f"| {metric.name} | {metric.change_1d_pct:+.2f}% | {metric.change_5d_pct:+.2f}% | {metric.signal} |"
+            )
+    if intelligence.headlines:
+        lines.extend(["", "### 최근 관련 뉴스", ""])
+        for item in intelligence.headlines[:6]:
+            suffix = f" · {item.source}" if item.source else ""
+            lines.append(f"- {item.title}{suffix}")
+    if intelligence.event_headlines:
+        lines.extend(["", "### 글로벌 사건·이벤트", ""])
+        for item in intelligence.event_headlines[:4]:
+            suffix = f" · {item.source}" if item.source else ""
+            lines.append(f"- {item.title}{suffix}")
+    if intelligence.sources:
+        lines.append(f"- 정보 소스: {', '.join(intelligence.sources)}")
+    if intelligence.notes:
+        lines.extend(f"- 참고: {note}" for note in intelligence.notes[:3])
+    lines.append("- 이 점수는 차트 신호를 보완하는 실험적 컨텍스트이며, 단독 매수·매도 신호가 아닙니다.")
+    return lines
+
+
+def _market_intelligence_summary_lines(intelligence: MarketIntelligence | None) -> list[str]:
+    if intelligence is None:
+        return ["## 시장·뉴스 보조 환경", "", "- 외부 시장·뉴스 정보를 사용하지 못해 차트 기준으로만 선별했습니다."]
+    lines = [
+        "## 시장·뉴스 보조 환경",
+        "",
+        f"> **{intelligence.one_line}**",
+    ]
+    if intelligence.metrics:
+        metric_text = " · ".join(
+            f"{metric.name} {metric.change_1d_pct:+.2f}%({metric.signal})"
+            for metric in intelligence.metrics[:5]
+        )
+        lines.append(f"- 주요 지표: {metric_text}")
+    if intelligence.headlines:
+        lines.append("- 최근 뉴스: " + " / ".join(item.title for item in intelligence.headlines[:3]))
+    if intelligence.event_headlines:
+        lines.append("- 글로벌 이벤트: " + " / ".join(item.title for item in intelligence.event_headlines[:2]))
+    if intelligence.notes:
+        lines.extend(f"- 참고: {note}" for note in intelligence.notes[:2])
+    lines.append("- 환경 점수가 매우 낮거나 이벤트 위험이 높으면 차트 관심 후보를 '기다림'으로 낮춥니다.")
+    return lines
+
+
 def render_scan_report(
     results: Iterable[AnalyzedStock],
     *,
@@ -305,6 +405,7 @@ def render_scan_report(
     finished_at: datetime,
     universe_stats: dict[str, int],
     failures: list[str],
+    intelligence: MarketIntelligence | None = None,
 ) -> str:
     values = list(results)
     interests = [item for item in values if _is_interest(item)]
@@ -319,12 +420,13 @@ def render_scan_report(
         "",
         f"> **결론: 관심 후보 {len(interests)}개 · 기다릴 종목 {len(waits)}개 · 피할 종목 {len(avoids)}개**",
         "> ETF·ETN·워런트·우선주·스팩과 유동성 부족 종목은 관심 후보에서 제외했습니다.",
+        "> 등급과 표시 순서는 분석 규칙에 따른 분류이며, 전체 선별 전략의 수익성이 검증되었다는 뜻은 아닙니다.",
         "",
         "> **가격 기준 읽는 법:** 관찰 기준 = 흐름을 확인할 가격 · 하락 경계 = 상승 시나리오가 깨지는 가격 · 첫 저항 = 위에서 막힐 수 있는 가격",
         "",
-        "## 1. 먼저 볼 관심 후보",
-        "",
     ]
+    lines.extend(_market_intelligence_summary_lines(intelligence))
+    lines.extend(["", "## 1. 먼저 볼 관심 후보", ""])
     lines.extend(_scan_table(interests, empty="현재 조건을 모두 통과한 관심 후보가 없습니다."))
     lines.extend(["", "## 2. 차트는 일부 좋지만 기다릴 종목", ""])
     lines.extend(_scan_table(waits, empty="없음", limit=60))
@@ -371,18 +473,12 @@ def one_line(result: AnalyzedStock) -> str:
     )
     return (
         f"{result.stock.display_name} ({result.stock.symbol}) | {result.daily.grade} | "
-        f"{result.daily.action} | {rate}"
+        f"{result.final_action} | 보조 {result.context_adjusted_score}/100 | {rate}"
     )
 
 
 def _is_interest(item: AnalyzedStock) -> bool:
-    return (
-        item.liquid
-        and item.daily.grade in {"A+", "A"}
-        and not item.daily.hard_blocks
-        and item.daily.higher_timeframe == "주봉도 상승 방향"
-        and "모두 상승" in item.daily.market_context
-    )
+    return item.is_interest
 
 
 def _sort_key(item: AnalyzedStock) -> tuple[int, int, float, float, float, float, float]:
@@ -427,7 +523,9 @@ def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> l
         )
         if similarity.sample_count and similarity.expected_return_pct is not None:
             past += f" · 평균 {similarity.expected_return_pct:+.2f}%"
-        action = daily.action.replace("|", "/")
+        if similarity.sample_count:
+            past += f" · {similarity.status}"
+        action = f"보조 {item.context_adjusted_score}/100 · {item.final_action}".replace("|", "/")
         if not item.liquid:
             action = f"유동성 부족: {item.liquidity_reason}"
         levels = (
