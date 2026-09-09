@@ -2,6 +2,14 @@
 .us_ichimoku_cache/
 .domestic_ichimoku_cache/
 reports/
+data/raw/
+data/metadata/checkpoints/
+data/metadata/failures/
+data/metadata/manifests/*.json
+data/metadata/quality/*.json
+data/metadata/quality/*.csv
+data/news/
+evaluation/datasets/
 __pycache__/
 .pytest_cache/
 *.pyc

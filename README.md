@@ -87,6 +87,43 @@ NAVER_CLIENT_SECRET=발급받은_클라이언트_SECRET
 
 외부 시장·뉴스 보조 기능을 완전히 끄고 기존 차트 분석만 쓰려면 `REAL_INTELLIGENCE_ENABLED=0`으로 실행합니다.
 
+뉴스 검색과 점수 로직은 그대로 유지하면서, 앞으로 분석기가 실제 사용한 뉴스는 기본적으로
+`data/news/` 아래에 원본 hash, 정규화 이벤트, 분석 시각과 함께 저장됩니다. 이 archive는
+향후 point-in-time 검증용이며 현재 65/35 점수나 판단에 다시 입력되지 않습니다.
+
+```text
+REAL_NEWS_ARCHIVE_ENABLED=1
+# 선택: 기본 data/news 대신 다른 보관 위치
+REAL_NEWS_ARCHIVE_ROOT=C:\path\to\news_archive
+
+# 무료 공식 공시 수집용
+DART_API_KEY=OpenDART_인증키
+SEC_USER_AGENT=이름 또는 조직 contact@example.com
+```
+
+무료 source 검증·수집 CLI는 다음처럼 실행합니다.
+
+```powershell
+# GDELT 15분 bulk 표본(Event/GKG/Mentions)
+py -3 collect_free_news.py --source GDELT --sample
+
+# OpenDART/SEC/현재 뉴스까지 포함. 키가 없거나 source가 실패해도 상태를 명시합니다.
+py -3 collect_free_news.py --source ALL --sample
+
+# 로컬 이벤트 index와 PIT/중복 상태 감사
+py -3 audit_news_archive.py
+```
+
+원본은 `data/news/raw/`, 정규화 결과는 `data/news/processed/events/`, 로컬 조회
+index는 `data/news/index/`, 실행별 사용 기록은 `data/news/forward/`에 분리됩니다.
+개별 분석 완료 시 기술점수·등급·기술판단·최종판단과 당시 보인 공시/뉴스/event ID가
+하나의 `analysis_id` snapshot으로 자동 저장됩니다. raw hash → normalized event →
+cluster 연결을 보존하므로 나중에 뉴스 알고리즘만 다시 적용할 수 있으며, 1/5/10/20일
+outcome은 별도 파일로 연결됩니다. OpenDART/SEC 자격증명이 없거나 API가 실패해도
+기술 분석은 계속됩니다.
+GDELT·OpenDART·SEC·Naver·Google RSS의 실제 범위와 신뢰 한계는
+[`docs/free_news_event_sources.md`](docs/free_news_event_sources.md)에 정리되어 있습니다.
+
 분석이 끝나면 안내되는 `report.html`을 더블클릭하면 별도 프로그램 없이 브라우저에서 볼 수 있습니다. 넓은 화면에서는 표의 내용이 셀 안에서 줄바꿈되고, 좁은 화면에서는 각 종목이 세로형 카드로 표시됩니다. 브라우저의 인쇄 기능으로 PDF 저장도 가능하며 기존 `report.md`도 함께 유지됩니다.
 
 ## 조정 가능한 값
@@ -120,6 +157,27 @@ py -3 domestic_stock_analyzer.py --self-test
 ```
 
 위 테스트와 자체점검은 합성 데이터 및 모의 응답을 사용하며 실시간 API 연결을 검증하지는 않습니다. 전체 분석에서 재시도 후에도 실패한 종목이 있으면 보고서는 보존하고, `--once` 실행은 종료 코드 `2`로 부분 실패를 알립니다.
+
+## Point-in-time 평가 데이터 기반
+
+운영 분석 규칙과 분리된 `data_pipeline/`은 과거 데이터의 원본/가공본, manifest,
+SHA-256, 품질 리포트, 실패 목록과 재개 체크포인트를 관리합니다. 현재 자격증명으로
+소규모 연결 검증을 실행하려면 다음 명령을 사용합니다.
+
+```powershell
+py -3 collect_historical_data.py --market BOTH --sample-size 20 --dataset historical_sample
+py -3 audit_historical_dataset.py --dataset historical_sample
+py -3 evaluate_analyzer.py --market BOTH --dataset historical_sample `
+  --baseline-mode TECHNICAL_BASELINE --decision-step 20
+```
+
+`historical_sample`은 현재 종목목록과 최근 Kiwoom 이력뿐인 탐색용 표본입니다. 날짜별
+상장폐지 포함 universe와 검증된 corporate-action 정책이 없으므로 out-of-sample
+성능 근거가 아닙니다. 신뢰 가능한 `historical` 데이터셋을 만들기 위한 KRX/CRSP/
+Norgate/Massive/Tiingo 비교와 필수 필드는
+[`docs/historical_data_sources.md`](docs/historical_data_sources.md)에 정리되어 있습니다.
+`TRUSTED/PARTIALLY_TRUSTED/EXPLORATORY/NOT_EVALUABLE` 판정 기준은
+[`docs/baseline_trust_gates.md`](docs/baseline_trust_gates.md)에 있습니다.
 
 장중 미완료 캔들, 손상된 가격·날짜·거래량 데이터, 미국 서머타임 전환을 포함한 분봉 캐시를 점검합니다. 주봉을 확인하지 못한 종목은 관심 판정을 보류하며, 과거 유사패턴은 일목 계산에 필요한 기간이 확보되고 이후 10거래일 결과가 모두 있는 표본만 사용합니다.
 

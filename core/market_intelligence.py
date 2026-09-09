@@ -3,7 +3,7 @@ from __future__ import annotations
 """Fail-soft market/news/event context for the stock analyzers."""
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -18,8 +18,14 @@ from xml.etree import ElementTree
 
 import requests
 
+from news_pipeline.normalization import (
+    classify_scope,
+    company_news_relevance,
+    context_relevance_metadata,
+)
+
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
-NAVER_NEWS_URL = "https://openapi.naver.com/v1/search/news.json"
+NAVER_NEWS_URL = "https://naverapihub.apigw.ntruss.com/search/v1/news"
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 USER_AGENT = "Real-Stock-Analyzer/1.0"
 
@@ -44,6 +50,23 @@ class NewsItem:
     published_at: str = ""
     sentiment: float = 0.0
     risk: float = 0.0
+    collected_at: str = ""
+    raw_hash: str = ""
+    source_type: str = ""
+    original_link: str = ""
+    provider_link: str = ""
+    source_level: int = 0
+    scope: str = "COMPANY"
+    source_event_type: str = "NEWS_ARTICLE"
+    normalized_event_type: str = ""
+    relevance_status: str = "UNASSESSED"
+    event_id: str = ""
+    entities: tuple[str, ...] = ()
+    event_time_precision: str = "second"
+    synthetic_time: bool = False
+    target_market_relevance: str = "UNASSESSED"
+    target_sector_relevance: str = "UNASSESSED"
+    target_company_relevance: str = "UNASSESSED"
 
 
 @dataclass(frozen=True)
@@ -58,9 +81,13 @@ class MarketIntelligence:
     metrics: tuple[MarketMetric, ...] = ()
     headlines: tuple[NewsItem, ...] = ()
     event_headlines: tuple[NewsItem, ...] = ()
+    official_headlines: tuple[NewsItem, ...] = ()
     notes: tuple[str, ...] = ()
     sources: tuple[str, ...] = ()
     generated_at: str = ""
+    market_context_score: int | None = None
+    stock_context_score: int | None = None
+    sector_context_score: int | None = None
 
     @property
     def adverse(self) -> bool:
@@ -97,9 +124,13 @@ class MarketIntelligence:
             metrics=tuple(MarketMetric(**item) for item in payload.get("metrics", []) if isinstance(item, dict)),
             headlines=tuple(NewsItem(**item) for item in payload.get("headlines", []) if isinstance(item, dict)),
             event_headlines=tuple(NewsItem(**item) for item in payload.get("event_headlines", []) if isinstance(item, dict)),
+            official_headlines=tuple(NewsItem(**item) for item in payload.get("official_headlines", []) if isinstance(item, dict)),
             notes=tuple(str(item) for item in payload.get("notes", [])),
             sources=tuple(str(item) for item in payload.get("sources", [])),
             generated_at=str(payload.get("generated_at", "")),
+            market_context_score=_optional_int(payload.get("market_context_score")),
+            stock_context_score=_optional_int(payload.get("stock_context_score")),
+            sector_context_score=_optional_int(payload.get("sector_context_score")),
         )
 
 
@@ -111,6 +142,8 @@ class MarketIntelligenceService:
         self.cache_minutes = max(1, min(240, int(os.getenv("REAL_INTELLIGENCE_CACHE_MINUTES", "20"))))
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
+        self.news_archive_enabled = _env_bool("REAL_NEWS_ARCHIVE_ENABLED", True)
+        self.news_store = self._build_news_store()
 
     def market_overview(self, market: str) -> MarketIntelligence | None:
         market = market.upper()
@@ -119,6 +152,14 @@ class MarketIntelligenceService:
         key = f"market:{market}"
         cached = self._load_cache(key)
         if cached is not None:
+            self._archive_context(
+                market=market,
+                symbol="*",
+                company_name=cached.scope,
+                query="market_overview:cache",
+                items=(*cached.headlines, *cached.event_headlines),
+                analysis_timestamp=_utc_now_iso(),
+            )
             return cached
 
         notes: list[str] = []
@@ -131,7 +172,7 @@ class MarketIntelligenceService:
         market_score = _market_metric_score(metrics)
 
         if market == "KR" and self._has_naver_credentials:
-            market_news, error = self._naver_search("코스피 코스닥 증시 금리 환율 반도체 수출", display=12)
+            market_news, error = self._naver_search("코스피 코스닥 증시 금리 환율 반도체 수출", display=12, scope="MARKET")
             if market_news:
                 sources.append("Naver News Search API")
         else:
@@ -164,6 +205,15 @@ class MarketIntelligenceService:
                 if fallback_error:
                     notes.append(fallback_error)
 
+        event_items = [
+            replace(
+                item,
+                scope=classify_scope(item.title, default=item.scope or "GLOBAL_EVENT"),
+                **context_relevance_metadata(item.title, target_market=market),
+            )
+            for item in event_items
+        ]
+
         news_score = _news_score(market_news) if market_news or error is None else None
         event_risk = _event_risk(event_items) if event_items or event_error is None else None
         score, label = _combine_environment_score(market_score, news_score, event_risk)
@@ -181,6 +231,15 @@ class MarketIntelligenceService:
             notes=tuple(dict.fromkeys(notes)),
             sources=tuple(dict.fromkeys(sources)),
             generated_at=_utc_now_iso(),
+            market_context_score=score,
+        )
+        self._archive_context(
+            market=market,
+            symbol="*",
+            company_name=result.scope,
+            query="market_overview",
+            items=(*result.headlines, *result.event_headlines),
+            analysis_timestamp=result.generated_at,
         )
         self._save_cache(key, result)
         return result
@@ -192,6 +251,38 @@ class MarketIntelligenceService:
         key = f"stock:{market}:{symbol.upper()}"
         cached = self._load_cache(key)
         if cached is not None:
+            cached_company, cached_context = _partition_stock_news(
+                cached.headlines,
+                market=market,
+                symbol=symbol,
+                company_name=name or symbol,
+                sector=sector,
+            )
+            cached = replace(
+                cached,
+                headlines=tuple(_dedupe_news(cached_company)),
+                event_headlines=tuple(
+                    _dedupe_news((*cached_context, *cached.event_headlines))
+                ),
+                market_context_score=(
+                    cached.market_context_score
+                    if cached.market_context_score is not None
+                    else (base.score if base else cached.score)
+                ),
+                stock_context_score=(
+                    cached.stock_context_score
+                    if cached.stock_context_score is not None
+                    else (_news_score(cached_company) if cached_company else None)
+                ),
+            )
+            self._archive_context(
+                market=market,
+                symbol=symbol,
+                company_name=name or symbol,
+                query="stock_overview:cache",
+                items=(*cached.official_headlines, *cached.headlines, *cached.event_headlines),
+                analysis_timestamp=_utc_now_iso(),
+            )
             return cached
         base = base or self.market_overview(market)
         notes = list(base.notes if base else ())
@@ -213,6 +304,20 @@ class MarketIntelligenceService:
         if error:
             notes.append(error)
 
+        company_news, contextual_news = _partition_stock_news(
+            stock_news,
+            market=market,
+            symbol=symbol,
+            company_name=name or symbol,
+            sector=sector,
+        )
+
+        official, official_notes, official_sources = self._official_filings(
+            market=market, symbol=symbol, company_name=name or symbol
+        )
+        notes.extend(official_notes)
+        sources.extend(official_sources)
+
         stock_score = _news_score(stock_news) if stock_news else None
         base_news_score = base.news_score if base else None
         if stock_score is not None and base_news_score is not None:
@@ -222,6 +327,7 @@ class MarketIntelligenceService:
         market_score = base.market_score if base else None
         event_risk = base.event_risk if base else None
         score, label = _combine_environment_score(market_score, news_score, event_risk)
+        sector_news = [item for item in contextual_news if item.scope == "SECTOR"]
         result = MarketIntelligence(
             market=market,
             scope=f"{name or symbol} ({symbol})",
@@ -231,11 +337,25 @@ class MarketIntelligenceService:
             news_score=news_score,
             event_risk=event_risk,
             metrics=base.metrics if base else (),
-            headlines=tuple(_dedupe_news(stock_news)[:8] or (base.headlines if base else ())),
-            event_headlines=base.event_headlines if base else (),
+            headlines=tuple(_dedupe_news(company_news)[:8]),
+            event_headlines=tuple(
+                _dedupe_news((*contextual_news, *(base.event_headlines if base else ())))[:10]
+            ),
+            official_headlines=tuple(official),
             notes=tuple(dict.fromkeys(notes)),
             sources=tuple(dict.fromkeys(sources)),
             generated_at=_utc_now_iso(),
+            market_context_score=base.score if base else None,
+            stock_context_score=_news_score(company_news) if company_news else None,
+            sector_context_score=_news_score(sector_news) if sector_news else None,
+        )
+        self._archive_context(
+            market=market,
+            symbol=symbol,
+            company_name=name or symbol,
+            query=query,
+            items=(*result.official_headlines, *result.headlines, *result.event_headlines),
+            analysis_timestamp=result.generated_at,
         )
         self._save_cache(key, result)
         return result
@@ -280,21 +400,36 @@ class MarketIntelligenceService:
         note = f"일부 시장지표 조회 실패({len(errors)}개): " + " / ".join(errors[:2]) if errors else None
         return ordered, note
 
-    def _naver_search(self, query: str, *, display: int) -> tuple[list[NewsItem], str | None]:
-        headers = {"X-Naver-Client-Id": os.getenv("NAVER_CLIENT_ID", ""), "X-Naver-Client-Secret": os.getenv("NAVER_CLIENT_SECRET", ""), "User-Agent": USER_AGENT}
+    def _naver_search(self, query: str, *, display: int, scope: str = "COMPANY") -> tuple[list[NewsItem], str | None]:
+        headers = {
+            "X-NCP-APIGW-API-KEY-ID": os.getenv("NAVER_CLIENT_ID", ""),
+            "X-NCP-APIGW-API-KEY": os.getenv("NAVER_CLIENT_SECRET", ""),
+            "User-Agent": USER_AGENT,
+        }
         try:
             response = self.session.get(NAVER_NEWS_URL, params={"query": query, "display": max(1, min(100, display)), "sort": "date"}, headers=headers, timeout=self.timeout)
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:
             return [], f"네이버 뉴스 조회 실패: {str(exc)[:120]}"
+        collected_at = _utc_now_iso()
+        raw_hash = self._archive_raw_response("naver", query, _response_bytes(response, payload))
         items: list[NewsItem] = []
         for row in payload.get("items", []):
             title = _clean_html(str(row.get("title", "")))
             if not title:
                 continue
             sentiment, risk = _headline_scores(title)
-            items.append(NewsItem(title, str(row.get("originallink") or row.get("link") or ""), "Naver", _normalize_pubdate(str(row.get("pubDate", ""))), sentiment, risk))
+            original_link = str(row.get("originallink") or "")
+            naver_link = str(row.get("link") or "")
+            items.append(
+                NewsItem(
+                    title, original_link or naver_link, "Naver",
+                    _normalize_pubdate(str(row.get("pubDate", ""))), sentiment, risk,
+                    collected_at, raw_hash, "NAVER_NEWS", original_link, naver_link,
+                    2, scope,
+                )
+            )
         return items, None
 
     def _gdelt_search(self, query: str, *, max_records: int, timespan: str) -> tuple[list[NewsItem], str | None]:
@@ -304,13 +439,22 @@ class MarketIntelligenceService:
             payload = response.json()
         except Exception as exc:
             return [], f"GDELT 뉴스 조회 실패: {str(exc)[:120]}"
+        collected_at = _utc_now_iso()
+        raw_hash = self._archive_raw_response("gdelt_doc", query, _response_bytes(response, payload))
         items: list[NewsItem] = []
         for row in payload.get("articles", []):
             title = _clean_html(str(row.get("title", "")))
             if not title:
                 continue
             sentiment, risk = _headline_scores(title)
-            items.append(NewsItem(title, str(row.get("url", "")), str(row.get("domain") or "GDELT"), str(row.get("seendate", "")), sentiment, risk))
+            items.append(
+                NewsItem(
+                    title, str(row.get("url", "")), str(row.get("domain") or "GDELT"),
+                    str(row.get("seendate", "")), sentiment, risk, collected_at, raw_hash,
+                    "GDELT_DOC", source_level=3, scope="GLOBAL_EVENT",
+                    relevance_status="GLOBAL_CANDIDATE",
+                )
+            )
         return items, None
 
     def _google_news_search(
@@ -339,7 +483,13 @@ class MarketIntelligenceService:
             root = ElementTree.fromstring(response.content)
         except Exception as exc:
             return [], f"Google News RSS 조회 실패: {str(exc)[:120]}"
+        collected_at = _utc_now_iso()
+        raw_hash = self._archive_raw_response("google", query, bytes(response.content))
         items: list[NewsItem] = []
+        market_query = any(
+            term in query.casefold()
+            for term in ("market", "wall street", "증시", "코스피", "kospi")
+        )
         for node in root.findall(".//item")[: max(1, min(50, max_records))]:
             title = _clean_html(node.findtext("title", default=""))
             if not title:
@@ -355,9 +505,156 @@ class MarketIntelligenceService:
                     published_at=_normalize_pubdate(node.findtext("pubDate", default="")),
                     sentiment=sentiment,
                     risk=risk,
+                    collected_at=collected_at,
+                    raw_hash=raw_hash,
+                    source_type="GOOGLE_NEWS_RSS",
+                    original_link=node.findtext("link", default=""),
+                    source_level=2,
+                    scope=classify_scope(title, default="MARKET" if market_query else "COMPANY"),
                 )
             )
         return items, None
+
+    def _official_filings(
+        self, *, market: str, symbol: str, company_name: str
+    ) -> tuple[list[NewsItem], list[str], list[str]]:
+        """Collect official evidence for display/archive only; never feed it into scoring."""
+
+        if self.news_store is None or symbol == "*":
+            return [], [], []
+        notes: list[str] = []
+        sources: list[str] = []
+        events: list[Any] = []
+        end_date = datetime.now(timezone.utc).date()
+        start_date = (end_date - timedelta(days=400)).isoformat()
+        try:
+            if market == "US":
+                from news_pipeline.sources.edgar import SecEdgarClient
+
+                client = SecEdgarClient(self.news_store, timeout=self.timeout)
+                if not client.available:
+                    return [], ["SEC_USER_AGENT 미설정: SEC 공식 공시는 생략"], []
+                mapping, mapping_result = client.fetch_tickers()
+                if mapping_result.errors:
+                    notes.extend(mapping_result.errors[:1])
+                company = mapping.get(symbol.upper())
+                if company:
+                    result = client.search_filings(
+                        cik=company["cik"], ticker=symbol, company_name=company_name,
+                        start_date=start_date, include_history_files=False,
+                    )
+                    events.extend(result.events)
+                    notes.extend(result.errors[:1])
+                    sources.append("SEC EDGAR")
+            elif market == "KR":
+                from news_pipeline.sources.dart import OpenDartClient
+
+                client = OpenDartClient(self.news_store, timeout=self.timeout)
+                if not client.available:
+                    return [], ["DART_API_KEY 미설정: OpenDART 공식 공시는 생략"], []
+                rows, mapping_result = client.fetch_corp_codes()
+                if mapping_result.errors:
+                    notes.extend(mapping_result.errors[:1])
+                company = client.ticker_map(rows).get(symbol.zfill(6))
+                if company:
+                    result = client.search_filings(
+                        corp_code=company["corp_code"], symbol=symbol,
+                        company_name=company_name, start_date=start_date,
+                        end_date=end_date.isoformat(), max_pages=10,
+                    )
+                    events.extend(result.events)
+                    notes.extend(result.errors[:1])
+                    sources.append("OpenDART")
+        except Exception as exc:
+            notes.append(f"공식 공시 조회 실패(분석은 계속): {str(exc)[:120]}")
+
+        now = datetime.now(timezone.utc)
+        visible = [
+            event for event in events
+            if event.first_seen_at and datetime.fromisoformat(event.first_seen_at) <= now
+        ]
+        visible.sort(key=lambda event: (event.event_time, event.event_id), reverse=True)
+        items = [
+            NewsItem(
+                title=event.title,
+                url=event.source_url,
+                source=event.source_name,
+                published_at=event.event_time,
+                collected_at=event.collected_at,
+                raw_hash=str(event.raw_reference.get("raw_hash") or ""),
+                source_type=event.source_type,
+                original_link=event.source_url,
+                source_level=event.source_level,
+                scope=event.scope,
+                source_event_type=event.source_event_type,
+                normalized_event_type=event.normalized_event_type,
+                relevance_status=event.relevance_status,
+                event_id=event.event_id,
+                entities=event.entities,
+                event_time_precision=event.event_time_precision,
+                synthetic_time=event.synthetic_time,
+                target_market_relevance=event.target_market_relevance,
+                target_sector_relevance=event.target_sector_relevance,
+                target_company_relevance=event.target_company_relevance,
+            )
+            for event in visible[:8]
+        ]
+        return items, notes, sources
+
+    def _build_news_store(self):
+        if not self.news_archive_enabled:
+            return None
+        try:
+            from news_pipeline.storage import NewsDataStore
+
+            configured = os.getenv("REAL_NEWS_ARCHIVE_ROOT", "").strip()
+            if configured:
+                root = Path(configured)
+            elif self.cache_path.parent.name == ".runtime":
+                root = self.cache_path.parent.parent / "data" / "news"
+            else:
+                root = self.cache_path.parent / "news_archive"
+            return NewsDataStore(root)
+        except Exception:
+            return None
+
+    def _archive_raw_response(self, source: str, query: str, payload: bytes) -> str:
+        if self.news_store is None:
+            return ""
+        try:
+            suffix = "xml" if source == "google" else "json"
+            artifact = self.news_store.store_raw(source, payload, suffix=suffix, query=query)
+            return artifact.data_hash
+        except Exception:
+            return ""
+
+    def _archive_context(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        company_name: str,
+        query: str,
+        items: Iterable[NewsItem],
+        analysis_timestamp: str,
+    ) -> None:
+        if self.news_store is None:
+            return
+        try:
+            from news_pipeline.archive import archive_visible_items
+
+            archive_visible_items(
+                self.news_store,
+                analysis_timestamp=analysis_timestamp,
+                market=market,
+                symbol=symbol,
+                company_name=company_name,
+                query=query,
+                source="market_intelligence",
+                items=items,
+            )
+        except Exception:
+            pass
 
     def _load_cache(self, key: str) -> MarketIntelligence | None:
         try:
@@ -392,6 +689,47 @@ class MarketIntelligenceService:
             self.cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+
+def _partition_stock_news(
+    items: Iterable[NewsItem],
+    *,
+    market: str,
+    symbol: str,
+    company_name: str,
+    sector: str,
+) -> tuple[list[NewsItem], list[NewsItem]]:
+    """Separate display/archive context without changing the score input list."""
+
+    company: list[NewsItem] = []
+    contextual: list[NewsItem] = []
+    for item in items:
+        relevance = company_news_relevance(
+            item.title,
+            company_name=company_name,
+            symbol=symbol,
+            organizations=item.entities,
+        )
+        metadata = context_relevance_metadata(
+            item.title,
+            target_market=market,
+            target_sector=sector,
+            company_name=company_name,
+        )
+        classified = replace(
+            item,
+            scope=str(relevance["scope"]),
+            relevance_status=str(relevance["status"]),
+            entities=tuple(str(value) for value in relevance["matches"]),
+            **metadata,
+        )
+        if classified.scope == "COMPANY" and classified.relevance_status == "DIRECT_COMPANY":
+            company.append(classified)
+        else:
+            contextual.append(classified)
+    return company, contextual
+
+
 _METRIC_CONFIG: dict[str, tuple[dict[str, Any], ...]] = {
     "KR": (
         {"name": "KOSPI", "symbol": "KS11", "weight": 1.35, "direction": 1, "scale1": 1.5, "scale5": 4.0},
@@ -547,3 +885,10 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _response_bytes(response: Any, parsed: Any) -> bytes:
+    content = getattr(response, "content", b"")
+    if content:
+        return bytes(content)
+    return json.dumps(parsed, ensure_ascii=False, sort_keys=True).encode("utf-8")

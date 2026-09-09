@@ -13,6 +13,9 @@ from .reporting import (
     _intelligence_lines,
     _market_intelligence_summary_lines,
     _table_cell,
+    final_action_bucket,
+    similarity_sample_note,
+    watch_price_display,
 )
 from .similarity import SimilarityResult
 
@@ -46,10 +49,10 @@ def render_domestic_individual_report(result: AnalyzedStock) -> str:
         if quote is not None
         else f"{daily.data_timestamp} 완료 일봉 기준이며 현재가를 조회한 값이 아닙니다."
     )
-    watch_text = (
-        "이 가격 부근을 지키는지 확인합니다. 현재가에서 무조건 접근하라는 뜻이 아닙니다."
-        if live_price >= daily.watch_price
-        else "현재가가 이 가격을 일봉 종가로 다시 넘어야 상승 확인이 좋아집니다."
+    watch_display = watch_price_display(
+        current_price=live_price,
+        watch_price=daily.watch_price,
+        invalidation_price=daily.invalidation_price,
     )
     target_text = (
         "도달 보장이 아닌 첫 저항 후보입니다."
@@ -90,7 +93,8 @@ def render_domestic_individual_report(result: AnalyzedStock) -> str:
             "|---|---:|---|",
             f"| {price_label} | {krw(live_price)} | {price_context} |",
             f"| 분석 기준 종가 | {krw(daily.close)} | {daily.data_timestamp} 완료 일봉; 등급과 가격 기준의 계산값입니다. |",
-            f"| 관찰 기준가 | {krw(daily.watch_price)} | {watch_text} |",
+            f"| {watch_display.label} | {krw(daily.watch_price)} | {watch_display.explanation} "
+            f"(상태: {watch_display.state}) |",
             f"| 하락 경계가 | {krw(daily.invalidation_price)} | 일봉 종가가 이 아래면 현재 상승 시나리오를 폐기합니다. |",
             f"| 첫 저항가 | {krw(daily.first_target_price)} | {target_text} |",
             "",
@@ -154,9 +158,9 @@ def render_domestic_scan_report(
     intelligence: MarketIntelligence | None = None,
 ) -> str:
     values = list(results)
-    interests = [item for item in values if _is_interest(item)]
-    waits = [item for item in values if item.daily.grade in {"A+", "A", "B"} and item not in interests]
-    avoids = [item for item in values if item not in interests and item not in waits]
+    interests = [item for item in values if final_action_bucket(item.final_action) == "interest"]
+    waits = [item for item in values if final_action_bucket(item.final_action) == "wait"]
+    avoids = [item for item in values if final_action_bucket(item.final_action) == "avoid"]
     interests.sort(key=_sort_key)
     waits.sort(key=_sort_key)
     avoids.sort(key=_sort_key)
@@ -168,7 +172,7 @@ def render_domestic_scan_report(
         "> KOSPI·KOSDAQ 거래대금 상위에서 우선주·스팩·관리/경고 종목과 유동성 부족 종목을 제외했습니다.",
         "> 등급과 표시 순서는 분석 규칙에 따른 분류이며, 전체 선별 전략의 수익성이 검증되었다는 뜻은 아닙니다.",
         "",
-        "> **가격 기준 읽는 법:** 관찰 기준 = 흐름을 확인할 가격 · 하락 경계 = 상승 시나리오가 깨지는 가격 · 첫 저항 = 위에서 막힐 수 있는 가격",
+        "> **가격 기준 읽는 법:** 눌림 지지 = 조정 시 지지 확인 · 회복 확인 = 위로 넘어야 할 가격 · 시나리오 밖 = 하락 경계보다 낮아 대기 기준으로 쓰지 않음 · 첫 저항 = 위에서 막힐 수 있는 가격",
         "",
     ]
     lines.extend(_market_intelligence_summary_lines(intelligence))
@@ -248,20 +252,33 @@ def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> l
     for item in items[:limit]:
         daily = item.daily
         similarity = item.similarity
-        past = (
-            f"{similarity.sample_count}건 중 {similarity.up_count}건 상승"
-            if similarity.up_rate is not None
-            else "표본 부족"
-        )
-        if similarity.sample_count and similarity.expected_return_pct is not None:
-            past += f" · 평균 {similarity.expected_return_pct:+.2f}%"
-        if similarity.sample_count:
-            past += f" · {similarity.status}"
+        sample_note = similarity_sample_note(similarity.sample_count)
+        if similarity.sample_count < 10:
+            past = f"{similarity.sample_count}건 · {sample_note}"
+        else:
+            past = (
+                f"{similarity.sample_count}건 중 {similarity.up_count}건 상승"
+                if similarity.up_rate is not None
+                else "표본 부족"
+            )
+            if similarity.sample_count and similarity.expected_return_pct is not None:
+                past += f" · 평균 {similarity.expected_return_pct:+.2f}%"
+            past += f" · {sample_note}"
         action = f"보조 {item.context_adjusted_score}/100 · {item.final_action}".replace("|", "/")
         if not item.liquid:
             action = f"유동성 부족: {item.liquidity_reason}"
+        watch = watch_price_display(
+            current_price=daily.close,
+            watch_price=daily.watch_price,
+            invalidation_price=daily.invalidation_price,
+        )
+        watch_level = (
+            f"관찰 기준 N/A (계산값 {krw(daily.watch_price)}은 시나리오 밖)"
+            if watch.state == "INVALID_WATCH_ZONE"
+            else f"{watch.label.removesuffix('가')} {krw(daily.watch_price)}"
+        )
         levels = (
-            f"관찰 기준 {krw(daily.watch_price)} · "
+            f"{watch_level} · "
             f"하락 경계 {krw(daily.invalidation_price)} · "
             f"첫 저항 {krw(daily.first_target_price)}"
         )
@@ -278,8 +295,14 @@ def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> l
 
 
 def _similarity_text(result: SimilarityResult) -> str:
+    sample_note = similarity_sample_note(result.sample_count)
+    if result.sample_count < 10:
+        return (
+            f"과거 표본 내 결과: 독립 표본 {result.sample_count}건 · {sample_note}. "
+            "수익률과 상승 비율은 표본이 너무 적어 표시하지 않습니다."
+        )
     if result.up_rate is None:
-        return f"과거 표본 내 결과: {result.sample_count}건 · {result.status}"
+        return f"과거 표본 내 결과: {result.sample_count}건 · {sample_note}"
     expected = (
         f"과거 표본 평균 수익률 {result.expected_return_pct:+.2f}%"
         if result.expected_return_pct is not None
@@ -302,7 +325,7 @@ def _similarity_text(result: SimilarityResult) -> str:
     )
     return (
         f"과거 표본 내 결과: 독립 표본 {result.sample_count}건 중 {result.up_count}건 상승({result.up_rate:.1f}%), "
-        f"중간 수익률 {median}, {expected}{downside}{invalidation} · {result.status}"
+        f"중간 수익률 {median}, {expected}{downside}{invalidation} · {sample_note}"
     )
 
 

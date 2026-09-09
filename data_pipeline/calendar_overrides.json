@@ -1,0 +1,18 @@
+{
+  "override_version": "2026-09-09.1",
+  "closed_sessions": {
+    "XKRX": [
+      {
+        "date": "2026-06-03",
+        "reason": "제9회 전국동시지방선거일 휴장",
+        "source": "https://strn.krx.co.kr/corebbs5/BHPSTRN0401/list"
+      },
+      {
+        "date": "2026-07-17",
+        "reason": "제헌절 임시공휴일 휴장",
+        "source": "https://strn.krx.co.kr/corebbs5/BHPSTRN0401/list"
+      }
+    ]
+  },
+  "early_close_sessions": {}
+}

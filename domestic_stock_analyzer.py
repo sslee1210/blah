@@ -168,6 +168,9 @@ class DomesticStockAnalyzer:
             base=market_intelligence,
         )
         result = replace(result, intelligence=stock_intelligence or market_intelligence)
+        from news_pipeline.integration import try_archive_analyzed_result
+
+        try_archive_analyzed_result(self.intelligence.news_store, result, market="KR")
         now = datetime.now(KOREA)
         folder = REPORTS_DIR / f"국내_{stock.symbol}_{now:%Y%m%d_%H%M%S}"
         folder.mkdir(parents=True, exist_ok=True)
@@ -528,6 +531,9 @@ def _write_scan_csv(path: Path, results: list[AnalyzedStock]) -> None:
                 "intelligence_market_score": item.intelligence.market_score if item.intelligence else None,
                 "intelligence_news_score": item.intelligence.news_score if item.intelligence else None,
                 "intelligence_event_risk": item.intelligence.event_risk if item.intelligence else None,
+                "market_context_score": item.intelligence.market_context_score if item.intelligence else None,
+                "stock_context_score": item.intelligence.stock_context_score if item.intelligence else None,
+                "sector_context_score": item.intelligence.sector_context_score if item.intelligence else None,
                 "timeframe": daily.timeframe,
                 "ichimoku_parameters": "9,26,52",
                 "data_source": "키움 REST API 국내주식 ka10081 수정주가 일봉",

@@ -7,7 +7,14 @@ import re
 import pytest
 
 from core.kiwoom_rest import InvalidSecurityError, KiwoomRestError
-from core.reporting import AnalyzedStock, render_html_report, render_individual_report, render_scan_report, usd
+from core.reporting import (
+    AnalyzedStock,
+    render_html_report,
+    render_individual_report,
+    render_scan_report,
+    usd,
+    watch_price_display,
+)
 from core.domestic_reporting import krw, render_domestic_individual_report, render_domestic_scan_report
 from core.similarity import SimilarityResult
 from tests.test_ichimoku import make_frame
@@ -156,7 +163,7 @@ def test_reports_do_not_label_fallback_daily_close_as_a_current_quote(renderer) 
     assert "분석 기준 종가" in report
     assert "거래량·기술지표는 분석 완료 일봉 기준" in report
     assert "하루 기준으로 환산" not in report
-    assert "과거 표본 내 결과: 0건 · 분석 기간 부족" in report
+    assert "과거 표본 내 결과: 독립 표본 0건 · 표본 부족 · 통계 해석 금지" in report
 
 
 @pytest.mark.parametrize(
@@ -243,4 +250,76 @@ def test_scan_shows_small_sample_warning_beside_its_returns(renderer) -> None:
     ))
     moment = datetime(2026, 9, 4, 14, tzinfo=timezone.utc)
     report = renderer([result], started_at=moment, finished_at=moment, universe_stats={}, failures=[])
-    assert "1건 중 1건 상승 · 평균 +5.00% · 표본 적음" in report
+    assert "1건 · 표본 부족 · 통계 해석 금지" in report
+    assert "1건 중 1건 상승" not in report
+    assert "평균 +5.00%" not in report
+
+
+@pytest.mark.parametrize("renderer", [render_scan_report, render_domestic_scan_report])
+def test_a_plus_with_final_avoid_is_counted_only_as_avoid(renderer) -> None:
+    result = _report_fixture()
+    result = replace(
+        result,
+        daily=replace(
+            result.daily,
+            grade="A+",
+            action="피하기 - 거래량·거래대금이 부족해 매매 후보에서 제외",
+        ),
+    )
+    moment = datetime(2026, 9, 4, 14, tzinfo=timezone.utc)
+
+    report = renderer(
+        [result], started_at=moment, finished_at=moment, universe_stats={}, failures=[]
+    )
+
+    assert "관심 후보 0개 · 기다릴 종목 0개 · 피할 종목 1개" in report
+    wait_section, avoid_section = report.split("## 3. 지금은 피할 종목", 1)
+    assert "테스트 (TEST)" not in wait_section.split("## 2. 차트는 일부 좋지만 기다릴 종목", 1)[1]
+    assert "테스트 (TEST)" in avoid_section
+
+
+def test_watch_price_below_invalidation_is_an_invalid_watch_zone() -> None:
+    display = watch_price_display(
+        current_price=100.0, watch_price=90.0, invalidation_price=95.0
+    )
+
+    assert display.state == "INVALID_WATCH_ZONE"
+    assert "유효한 대기 가격" in display.explanation
+
+
+@pytest.mark.parametrize("renderer", [render_individual_report, render_domestic_individual_report])
+def test_watch_price_above_current_is_worded_as_recovery_trigger(renderer) -> None:
+    result = _report_fixture()
+    result = replace(
+        result,
+        daily=replace(
+            result.daily,
+            watch_price=result.daily.close + 10.0,
+            invalidation_price=result.daily.close - 10.0,
+        ),
+    )
+
+    report = renderer(result)
+
+    assert "회복 확인가" in report
+    assert "RECOVERY_TRIGGER" in report
+    assert "이 가격 부근을 지키" not in report
+
+
+@pytest.mark.parametrize("renderer", [render_individual_report, render_domestic_individual_report])
+def test_invalid_watch_zone_is_not_worded_as_a_pullback_entry(renderer) -> None:
+    result = _report_fixture()
+    result = replace(
+        result,
+        daily=replace(
+            result.daily,
+            watch_price=result.daily.close - 20.0,
+            invalidation_price=result.daily.close - 10.0,
+        ),
+    )
+
+    report = renderer(result)
+
+    assert "관찰 기준가(시나리오 밖)" in report
+    assert "INVALID_WATCH_ZONE" in report
+    assert "조정 시 이 부근의 지지 여부" not in report

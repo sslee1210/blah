@@ -36,6 +36,33 @@ class InvalidSecurityError(KiwoomRestError):
     """The requested code is not a supported US common stock."""
 
 
+class OhlcQualityError(KiwoomRestError):
+    """A provider bar failed strict OHLC validation and remains blocked."""
+
+    def __init__(self, category: str, message: str) -> None:
+        self.category = category
+        super().__init__(f"[{category}] {message}")
+
+
+_KIWOOM_CLASS_SHARE_SYMBOLS = {
+    "BRK.B": "BRKB",
+    "BRK-B": "BRKB",
+    "BRK/B": "BRKB",
+    "BRKB": "BRKB",
+    "BRK.A": "BRKA",
+    "BRK-A": "BRKA",
+    "BRK/A": "BRKA",
+    "BRKA": "BRKA",
+}
+
+
+def normalize_kiwoom_us_symbol(symbol: str) -> str:
+    """Normalize public class-share notation to Kiwoom's stock-master code."""
+
+    value = str(symbol or "").strip().upper()
+    return _KIWOOM_CLASS_SHARE_SYMBOLS.get(value, value)
+
+
 @dataclass(frozen=True)
 class StockInfo:
     symbol: str
@@ -316,7 +343,7 @@ class KiwoomRestClient:
         )
         result: dict[tuple[str, str], StockInfo] = {}
         for row in rows:
-            symbol = str(row.get("stk_cd", "")).strip().upper()
+            symbol = normalize_kiwoom_us_symbol(str(row.get("stk_cd", "")))
             stex = str(row.get("stex_tp", "")).strip().upper()
             if not symbol or stex not in EXCHANGE_NAMES:
                 continue
@@ -332,6 +359,7 @@ class KiwoomRestClient:
 
     def stock_info(self, symbol: str, exchange: str) -> StockInfo:
         exchange = exchange.strip().upper()
+        provider_symbol = normalize_kiwoom_us_symbol(symbol)
         if exchange not in EXCHANGE_NAMES:
             raise InvalidSecurityError(
                 f"{symbol} 종목 조회에는 ND·NY·NA 중 하나의 거래소 코드가 필요합니다."
@@ -339,10 +367,10 @@ class KiwoomRestClient:
         payload, _ = self.request(
             "usa10100",
             "/api/us/stkinfo",
-            {"stex_tp": exchange, "stk_cd": symbol.upper()},
+            {"stex_tp": exchange, "stk_cd": provider_symbol},
         )
         stex = str(payload.get("stex_tp", exchange)).strip().upper()
-        code = str(payload.get("stk_cd", symbol)).strip().upper()
+        code = normalize_kiwoom_us_symbol(str(payload.get("stk_cd", provider_symbol)))
         if not code or stex not in EXCHANGE_NAMES:
             raise InvalidSecurityError(f"{symbol}의 미국 거래소를 확인하지 못했습니다.")
         return StockInfo(
@@ -358,7 +386,7 @@ class KiwoomRestClient:
         payload, _ = self.request(
             "usa20100",
             "/api/us/mrkcond",
-            {"stex_tp": stock.exchange, "stk_cd": stock.symbol},
+            {"stex_tp": stock.exchange, "stk_cd": normalize_kiwoom_us_symbol(stock.symbol)},
         )
         price = number(payload.get("cur_prc"), absolute=True)
         if price is None or price <= 0:
@@ -391,7 +419,7 @@ class KiwoomRestClient:
             "/api/us/chart",
             {
                 "stex_tp": stock.exchange,
-                "stk_cd": stock.symbol,
+                "stk_cd": normalize_kiwoom_us_symbol(stock.symbol),
                 # usa06012 returns bars backwards from this anchor date.  A
                 # past lower-bound here silently makes the whole result old.
                 "strt_dt": now.strftime("%Y%m%d"),
@@ -432,7 +460,7 @@ class KiwoomRestClient:
             "/api/us/chart",
             {
                 "stex_tp": stock.exchange,
-                "stk_cd": stock.symbol,
+                "stk_cd": normalize_kiwoom_us_symbol(stock.symbol),
                 "strt_dt": now.strftime("%Y%m%d"),
                 "tic_scope": str(interval_minutes),
                 "upd_stkpc_tp": "1",
@@ -518,9 +546,17 @@ def _daily_frame(rows: Iterable[dict[str, Any]]) -> pd.DataFrame:
 def _validate_us_bar(values: dict[str, Any]) -> None:
     prices = [values[key] for key in ("open", "high", "low", "close")]
     if pd.isna(values["timestamp"]) or any(value is None or value <= 0 for value in prices):
-        raise KiwoomRestError("미국 차트 OHLCV 날짜 또는 가격이 비어 있거나 올바르지 않습니다.")
+        raise OhlcQualityError(
+            "C:MALFORMED_OHLC",
+            "미국 차트 OHLCV 날짜 또는 가격이 비어 있거나 올바르지 않습니다.",
+        )
     if values["high"] < max(prices) or values["low"] > min(prices):
-        raise KiwoomRestError("미국 차트 OHLCV 고가·저가와 시가·종가의 관계가 올바르지 않습니다.")
+        ratio = max(prices) / min(prices)
+        category = "B:CORPORATE_ACTION_SUSPECTED" if ratio >= 1.5 else "C:MALFORMED_OHLC"
+        raise OhlcQualityError(
+            category,
+            "미국 차트 OHLCV 고가·저가와 시가·종가의 관계가 올바르지 않습니다.",
+        )
 
 
 def latest_completed_us_weekday(now: datetime | None = None) -> date:

@@ -7,7 +7,13 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .kiwoom_rest import EXCHANGE_NAMES, KiwoomRestClient, StockInfo, number
+from .kiwoom_rest import (
+    EXCHANGE_NAMES,
+    KiwoomRestClient,
+    StockInfo,
+    normalize_kiwoom_us_symbol,
+    number,
+)
 
 
 EXCLUDED_NAME = re.compile(
@@ -50,7 +56,9 @@ def build_scan_universe(
 ) -> tuple[list[UniverseCandidate], dict[str, int]]:
     """Blend market-cap and dollar-volume ranks, then cap sector crowding."""
 
-    master_by_key = {(item.exchange, item.symbol): item for item in master}
+    master_by_key = {
+        (item.exchange, normalize_kiwoom_us_symbol(item.symbol)): item for item in master
+    }
 
     cap_rows = client.ranking("usa20550", max_rows=max(target_size * 2, 300))
     value_rows = client.ranking("usa20540", max_rows=max(target_size * 2, 300))
@@ -58,7 +66,7 @@ def build_scan_universe(
 
     def ingest(rows: list[dict[str, Any]], source: str) -> None:
         for index, row in enumerate(rows, start=1):
-            symbol = str(row.get("stk_cd", "")).strip().upper()
+            symbol = normalize_kiwoom_us_symbol(str(row.get("stk_cd", "")))
             exchange = str(row.get("stex_tp", "")).strip().upper()
             if not symbol or exchange not in EXCHANGE_NAMES:
                 continue

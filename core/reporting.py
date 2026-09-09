@@ -56,14 +56,67 @@ class AnalyzedStock:
     @property
     def is_interest(self) -> bool:
         """Use the final analysis decision consistently in every scan output."""
-        return (
-            self.liquid
-            and self.final_action.startswith("관심")
-            and self.daily.grade in {"A+", "A"}
-            and not self.daily.hard_blocks
-            and self.daily.higher_timeframe == "주봉도 상승 방향"
-            and "모두 상승" in self.daily.market_context
+        return final_action_bucket(self.final_action) == "interest"
+
+
+@dataclass(frozen=True)
+class WatchPriceDisplay:
+    state: str
+    label: str
+    explanation: str
+
+
+def final_action_bucket(action: str) -> str:
+    """Map the actual operating action to the report section without regrading it."""
+
+    normalized = str(action or "").strip()
+    if normalized.startswith("관심"):
+        return "interest"
+    if normalized.startswith("기다림"):
+        return "wait"
+    if normalized.startswith("피하기"):
+        return "avoid"
+    raise ValueError(f"알 수 없는 최종 판단이라 보고서에 집계할 수 없습니다: {normalized or '빈 값'}")
+
+
+def watch_price_display(
+    *, current_price: float, watch_price: float, invalidation_price: float
+) -> WatchPriceDisplay:
+    """Describe existing price levels without changing any calculated value."""
+
+    if watch_price <= invalidation_price:
+        return WatchPriceDisplay(
+            state="INVALID_WATCH_ZONE",
+            label="관찰 기준가(시나리오 밖)",
+            explanation=(
+                "계산값이 하락 경계보다 낮아 현재 상승 시나리오의 유효한 대기 가격으로 "
+                "사용할 수 없습니다. 하락 경계를 먼저 적용합니다."
+            ),
         )
+    if watch_price > current_price:
+        return WatchPriceDisplay(
+            state="RECOVERY_TRIGGER",
+            label="회복 확인가",
+            explanation="현재가가 이 가격을 일봉 종가로 다시 넘어야 상승 회복을 확인할 수 있습니다.",
+        )
+    return WatchPriceDisplay(
+        state="WATCH_SUPPORT",
+        label="눌림 지지 확인가",
+        explanation=(
+            "현재가보다 낮고 하락 경계보다 높은 가격입니다. 조정 시 이 부근의 지지 여부를 "
+            "확인하며, 현재가에서 무조건 접근하라는 뜻이 아닙니다."
+        ),
+    )
+
+
+def similarity_sample_note(sample_count: int) -> str:
+    """UI-only confidence wording; it never changes similarity calculations."""
+
+    if sample_count < 10:
+        return "표본 부족 · 통계 해석 금지"
+    if sample_count < 20:
+        return "참고 수준"
+    return "제한적 참고"
 
 
 def render_html_report(
@@ -243,10 +296,10 @@ def render_individual_report(result: AnalyzedStock) -> str:
     risks = list(daily.risks[:3])
     similarity = _similarity_text(result.similarity)
     intraday = _intraday_text(result.intraday)
-    support_text = (
-        "이 가격 부근을 지키는지 확인하세요. 현재가에서 무조건 사라는 뜻이 아닙니다."
-        if live_price >= daily.watch_price
-        else "현재가가 이 가격을 종가로 다시 넘어야 상승 확인이 좋아집니다."
+    watch_display = watch_price_display(
+        current_price=live_price,
+        watch_price=daily.watch_price,
+        invalidation_price=daily.invalidation_price,
     )
     invalidation_text = (
         "일봉 종가가 이 아래로 내려가면 지금의 상승 시나리오는 폐기합니다."
@@ -282,7 +335,8 @@ def render_individual_report(result: AnalyzedStock) -> str:
             "|---|---:|---|",
             f"| {price_label} | {usd(live_price)} | {price_context} |",
             f"| 분석 기준 종가 | {usd(daily.close)} | {daily.data_timestamp} 완료 일봉; 등급과 가격 기준의 계산값입니다. |",
-            f"| 관찰 기준가 | {usd(daily.watch_price)} | {support_text} |",
+            f"| {watch_display.label} | {usd(daily.watch_price)} | {watch_display.explanation} "
+            f"(상태: {watch_display.state}) |",
             f"| 하락 경계가 | {usd(daily.invalidation_price)} | {invalidation_text} |",
             f"| 첫 저항가 | {usd(daily.first_target_price)} | {target_text} |",
             "",
@@ -350,28 +404,67 @@ def _intelligence_lines(intelligence: MarketIntelligence | None) -> list[str]:
         lines.append(f"- 최근 뉴스 점수: {intelligence.news_score}/100")
     if intelligence.event_risk is not None:
         lines.append(f"- 글로벌 이벤트 위험: {intelligence.event_risk}/100 (높을수록 부담)")
+    context_parts = []
+    if intelligence.market_context_score is not None:
+        context_parts.append(f"시장 {intelligence.market_context_score}/100")
+    if intelligence.stock_context_score is not None:
+        context_parts.append(f"기업 {intelligence.stock_context_score}/100")
+    if intelligence.sector_context_score is not None:
+        context_parts.append(f"산업 {intelligence.sector_context_score}/100")
+    if context_parts:
+        lines.append(
+            "- 검증용 context 분리: " + " · ".join(context_parts)
+            + " (현재 최종 점수에 새 가중치로 추가하지 않음)"
+        )
     if intelligence.metrics:
         lines.extend(["", "### 주요 시장 지표", "", "| 지표 | 1일 | 5일 | 해석 |", "|---|---:|---:|:---:|"])
         for metric in intelligence.metrics:
             lines.append(
                 f"| {metric.name} | {metric.change_1d_pct:+.2f}% | {metric.change_5d_pct:+.2f}% | {metric.signal} |"
             )
-    if intelligence.headlines:
-        lines.extend(["", "### 최근 관련 뉴스", ""])
-        for item in intelligence.headlines[:6]:
-            suffix = f" · {item.source}" if item.source else ""
-            lines.append(f"- {item.title}{suffix}")
-    if intelligence.event_headlines:
-        lines.extend(["", "### 글로벌 사건·이벤트", ""])
-        for item in intelligence.event_headlines[:4]:
-            suffix = f" · {item.source}" if item.source else ""
-            lines.append(f"- {item.title}{suffix}")
+    official = [
+        item for item in intelligence.official_headlines
+        if item.scope == "COMPANY" and item.relevance_status == "DIRECT_COMPANY"
+    ]
+    company = [
+        item for item in intelligence.headlines
+        if item.scope == "COMPANY" and item.relevance_status == "DIRECT_COMPANY"
+    ]
+    context = [
+        item for item in (*intelligence.headlines, *intelligence.event_headlines)
+        if not (item.scope == "COMPANY" and item.relevance_status == "DIRECT_COMPANY")
+    ]
+    if official:
+        lines.extend(["", "### 기업 공식 공시", ""])
+        for item in official[:6]:
+            lines.append(_evidence_line(item))
+    if company:
+        lines.extend(["", "### 최근 기업 뉴스", ""])
+        for item in company[:6]:
+            lines.append(_evidence_line(item))
+    if context:
+        lines.extend(["", "### 산업·시장·글로벌 이벤트", ""])
+        for item in context[:6]:
+            lines.append(_evidence_line(item))
     if intelligence.sources:
         lines.append(f"- 정보 소스: {', '.join(intelligence.sources)}")
     if intelligence.notes:
         lines.extend(f"- 참고: {note}" for note in intelligence.notes[:3])
     lines.append("- 이 점수는 차트 신호를 보완하는 실험적 컨텍스트이며, 단독 매수·매도 신호가 아닙니다.")
     return lines
+
+
+def _evidence_line(item: object) -> str:
+    title = str(getattr(item, "title", "") or "제목 없음")
+    source = str(getattr(item, "source", "") or "출처 미상")
+    published = str(getattr(item, "published_at", "") or "")
+    precision = str(getattr(item, "event_time_precision", "second") or "second").casefold()
+    synthetic = bool(getattr(item, "synthetic_time", False))
+    if published and (precision in {"date", "date_only"} or synthetic):
+        timestamp = published[:10]
+    else:
+        timestamp = published[:16].replace("T", " ") if published else "시각 미상"
+    return f"- {title} · {source} · {timestamp}"
 
 
 def _market_intelligence_summary_lines(intelligence: MarketIntelligence | None) -> list[str]:
@@ -408,9 +501,9 @@ def render_scan_report(
     intelligence: MarketIntelligence | None = None,
 ) -> str:
     values = list(results)
-    interests = [item for item in values if _is_interest(item)]
-    waits = [item for item in values if item.daily.grade in {"A+", "A", "B"} and item not in interests]
-    avoids = [item for item in values if item not in interests and item not in waits]
+    interests = [item for item in values if final_action_bucket(item.final_action) == "interest"]
+    waits = [item for item in values if final_action_bucket(item.final_action) == "wait"]
+    avoids = [item for item in values if final_action_bucket(item.final_action) == "avoid"]
     interests.sort(key=_sort_key)
     waits.sort(key=_sort_key)
     avoids.sort(key=_sort_key)
@@ -422,7 +515,7 @@ def render_scan_report(
         "> ETF·ETN·워런트·우선주·스팩과 유동성 부족 종목은 관심 후보에서 제외했습니다.",
         "> 등급과 표시 순서는 분석 규칙에 따른 분류이며, 전체 선별 전략의 수익성이 검증되었다는 뜻은 아닙니다.",
         "",
-        "> **가격 기준 읽는 법:** 관찰 기준 = 흐름을 확인할 가격 · 하락 경계 = 상승 시나리오가 깨지는 가격 · 첫 저항 = 위에서 막힐 수 있는 가격",
+        "> **가격 기준 읽는 법:** 눌림 지지 = 조정 시 지지 확인 · 회복 확인 = 위로 넘어야 할 가격 · 시나리오 밖 = 하락 경계보다 낮아 대기 기준으로 쓰지 않음 · 첫 저항 = 위에서 막힐 수 있는 가격",
         "",
     ]
     lines.extend(_market_intelligence_summary_lines(intelligence))
@@ -516,20 +609,33 @@ def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> l
     for item in items[:limit]:
         daily = item.daily
         similarity = item.similarity
-        past = (
-            f"{similarity.sample_count}건 중 {similarity.up_count}건 상승"
-            if similarity.up_rate is not None
-            else "표본 부족"
-        )
-        if similarity.sample_count and similarity.expected_return_pct is not None:
-            past += f" · 평균 {similarity.expected_return_pct:+.2f}%"
-        if similarity.sample_count:
-            past += f" · {similarity.status}"
+        sample_note = similarity_sample_note(similarity.sample_count)
+        if similarity.sample_count < 10:
+            past = f"{similarity.sample_count}건 · {sample_note}"
+        else:
+            past = (
+                f"{similarity.sample_count}건 중 {similarity.up_count}건 상승"
+                if similarity.up_rate is not None
+                else "표본 부족"
+            )
+            if similarity.sample_count and similarity.expected_return_pct is not None:
+                past += f" · 평균 {similarity.expected_return_pct:+.2f}%"
+            past += f" · {sample_note}"
         action = f"보조 {item.context_adjusted_score}/100 · {item.final_action}".replace("|", "/")
         if not item.liquid:
             action = f"유동성 부족: {item.liquidity_reason}"
+        watch = watch_price_display(
+            current_price=daily.close,
+            watch_price=daily.watch_price,
+            invalidation_price=daily.invalidation_price,
+        )
+        watch_level = (
+            f"관찰 기준 N/A (계산값 {usd(daily.watch_price)}은 시나리오 밖)"
+            if watch.state == "INVALID_WATCH_ZONE"
+            else f"{watch.label.removesuffix('가')} {usd(daily.watch_price)}"
+        )
         levels = (
-            f"관찰 기준 {usd(daily.watch_price)} · "
+            f"{watch_level} · "
             f"하락 경계 {usd(daily.invalidation_price)} · "
             f"첫 저항 {usd(daily.first_target_price)}"
         )
@@ -545,8 +651,14 @@ def _scan_table(items: list[AnalyzedStock], *, empty: str, limit: int = 80) -> l
 
 
 def _similarity_text(result: SimilarityResult) -> str:
+    sample_note = similarity_sample_note(result.sample_count)
+    if result.sample_count < 10:
+        return (
+            f"과거 표본 내 결과: 독립 표본 {result.sample_count}건 · {sample_note}. "
+            "수익률과 상승 비율은 표본이 너무 적어 표시하지 않습니다."
+        )
     if result.up_rate is None:
-        return f"과거 표본 내 결과: {result.sample_count}건 · {result.status}"
+        return f"과거 표본 내 결과: {result.sample_count}건 · {sample_note}"
     recent = (
         f" 최근 표본은 {result.recent_up_count}/{result.recent_sample_count}건 상승"
         if result.recent_sample_count
@@ -593,7 +705,7 @@ def _similarity_text(result: SimilarityResult) -> str:
         f"각 보조지표까지 최대한 같은 {result.sample_count}건을 사용했습니다. "
         f"과거 표본 내 결과: {result.sample_count}건 중 {result.up_count}건 상승({result.up_rate:.1f}%), "
         f"중간 수익률 {median}, {average_up}, {average_down}, "
-        f"{expected}{downside}{payoff}, {invalidation}.{recent} · {result.status}"
+        f"{expected}{downside}{payoff}, {invalidation}.{recent} · {sample_note}"
     )
 
 
@@ -702,7 +814,14 @@ def _table_cell_html(header: str, text: str) -> str:
         return _status_html(text)
     if normalized == "가격 기준":
         parts = [part.strip() for part in text.split("·") if part.strip()]
-        labels = ("관찰 기준", "하락 경계", "첫 저항")
+        labels = (
+            "관찰 기준 N/A",
+            "관찰 기준",
+            "눌림 지지 확인",
+            "회복 확인",
+            "하락 경계",
+            "첫 저항",
+        )
         rows: list[str] = []
         for part in parts:
             for label in labels:

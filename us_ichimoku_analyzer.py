@@ -30,6 +30,7 @@ from core.kiwoom_rest import (
     StockInfo,
     completed_daily_bars,
     completed_us_minute_bars,
+    normalize_kiwoom_us_symbol,
     regular_session_minute_bars,
 )
 from core.market_intelligence import MarketIntelligenceService
@@ -111,7 +112,7 @@ class USStockAnalyzer:
 
     def resolve_stock(self, text: str) -> StockInfo:
         query = _command_query(text)
-        normalized = query.strip().upper()
+        normalized = normalize_kiwoom_us_symbol(query)
         master = self.master()
         if SYMBOL_RE.fullmatch(normalized):
             matches = _unique_stocks(
@@ -207,6 +208,9 @@ class USStockAnalyzer:
             base=market_intelligence,
         )
         result = replace(result, intelligence=stock_intelligence or market_intelligence)
+        from news_pipeline.integration import try_archive_analyzed_result
+
+        try_archive_analyzed_result(self.intelligence.news_store, result, market="US")
         now = datetime.now(US_EASTERN)
         folder = REPORTS_DIR / f"{stock.symbol}_{now:%Y%m%d_%H%M%S}"
         folder.mkdir(parents=True, exist_ok=True)
@@ -534,6 +538,9 @@ def _write_scan_csv(path: Path, results: list[AnalyzedStock]) -> None:
                 "intelligence_market_score": item.intelligence.market_score if item.intelligence else None,
                 "intelligence_news_score": item.intelligence.news_score if item.intelligence else None,
                 "intelligence_event_risk": item.intelligence.event_risk if item.intelligence else None,
+                "market_context_score": item.intelligence.market_context_score if item.intelligence else None,
+                "stock_context_score": item.intelligence.stock_context_score if item.intelligence else None,
+                "sector_context_score": item.intelligence.sector_context_score if item.intelligence else None,
                 "data_timestamp": daily.data_timestamp,
                 "source_range": daily.source_range,
                 "timeframe": daily.timeframe,
