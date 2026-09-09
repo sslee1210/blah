@@ -13,6 +13,7 @@ from data_pipeline.calendars import exchange_sessions, session_status
 from data_pipeline.point_in_time import SecurityHistory, eligible_on, point_in_time_slice, price_views
 from data_pipeline.quality import inspect_daily_prices
 from data_pipeline.storage import HistoricalDataStore, sha256_file
+import data_pipeline.storage as historical_storage
 from data_pipeline.krx_open_api import (
     KRX_API_BASE,
     KrxApiResponse,
@@ -98,6 +99,26 @@ def test_duplicate_rows_are_reported_not_silently_fixed() -> None:
     )
     assert any(item.code == "duplicate_session" and item.severity == "error" for item in report.issues)
     assert len(duplicate) == 6
+
+
+def test_atomic_write_retries_transient_permission_error(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "checkpoint.json"
+    real_replace = Path.replace
+    calls = {"count": 0}
+
+    def flaky_replace(self: Path, target: Path):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise PermissionError("transient scanner lock")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+    monkeypatch.setattr(historical_storage.time, "sleep", lambda _: None)
+
+    historical_storage._atomic_write(path, b"ok")
+
+    assert path.read_bytes() == b"ok"
+    assert calls["count"] == 3
 
 
 def test_raw_prices_feed_signals_and_adjusted_prices_feed_outcomes() -> None:
@@ -385,7 +406,7 @@ def test_krx_batch_publishes_existing_evaluator_contract_but_stays_untrusted(tmp
     assert set(proxies) == {"KOSPI", "KOSDAQ"}
     assert universe.iloc[0]["permanent_id"] == "KR7005930003"
     assert universe.iloc[0]["trade_value_rank"] == 1
-    assert manifest.survivorship_safe is False
+    assert manifest.survivorship_safe is True
     assert manifest.delisted_securities_included is False
     assert manifest.corporate_action_verified is False
     assert manifest.trust_level == "EXPLORATORY"

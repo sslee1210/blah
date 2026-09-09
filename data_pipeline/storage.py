@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import time
 from typing import Iterable
 
 import pandas as pd
@@ -210,7 +211,21 @@ def _atomic_write(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_bytes(payload)
-    temporary.replace(path)
+    # Windows can briefly deny os.replace when antivirus/indexing software has
+    # the destination or freshly-written temp file open.  Large historical
+    # checkpoints are rewritten many times, so a transient lock must not abort
+    # an otherwise valid collection run.  Keep the atomic replace semantics and
+    # retry only PermissionError; other filesystem errors still surface.
+    delay = 0.02
+    for attempt in range(10):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2.0, 0.5)
 
 
 def _safe_component(value: str) -> str:

@@ -154,10 +154,14 @@ class KrxHistoricalAdapter:
     corporate_action_policy = (
         "unverified; KRX daily raw prices have no reconciled split factor or adjusted outcome series"
     )
-    survivorship_safe = False
-    point_in_time_level = (
-        "official date-keyed KRX cross-sections; completeness pending live delisting validation"
-    )
+    # KRX returns the full date-keyed listing/trading cross-section.  Live
+    # validation after service approval confirmed securities that existed in
+    # earlier snapshots but disappeared from the latest snapshot, so replay
+    # membership no longer needs to fall back to today's survivors.  This flag
+    # covers universe membership only; delisting returns and corporate-action
+    # adjusted outcomes remain separate, unverified trust gates below.
+    survivorship_safe = True
+    point_in_time_level = "official date-keyed KRX cross-sections"
 
     def __init__(self, client: KrxOpenApiClient) -> None:
         self.client = client
@@ -394,7 +398,12 @@ def publish_krx_batch(
         requests_.append(request)
         frames[request.key] = frame
     provider = _KrxBatchProvider(frames)
-    manifest = ResumableCollector(store, provider, max_attempts=1).collect(
+    manifest = ResumableCollector(
+        store,
+        provider,
+        max_attempts=1,
+        checkpoint_every=25,
+    ).collect(
         requests_,
         resume=resume,
         universe_snapshot_path=str(universe_path.relative_to(store.project_root)),
@@ -410,10 +419,10 @@ class _KrxBatchProvider:
     timezone_by_market = {"KR": "Asia/Seoul"}
     price_adjustment = KrxHistoricalAdapter.price_adjustment
     corporate_action_policy = KrxHistoricalAdapter.corporate_action_policy
-    survivorship_safe = False
+    survivorship_safe = KrxHistoricalAdapter.survivorship_safe
     point_in_time_level = KrxHistoricalAdapter.point_in_time_level
     limitations = (
-        "상장폐지 종목 포함 여부를 실제 과거/현재 KRX 응답 사례로 검증하기 전입니다.",
+        "날짜별 KRX cross-section으로 과거 universe membership은 재현하지만 delisting return은 별도 검증 전입니다.",
         "KRX raw 일별가격과 split-adjusted outcome을 연결할 corporate-action 원장이 없습니다.",
         "따라서 이 데이터셋은 TECHNICAL_BASELINE 연결 검증용이며 성능 주장에 사용할 수 없습니다.",
     )

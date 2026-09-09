@@ -13,7 +13,12 @@ from news_pipeline.archive import archive_visible_items
 from news_pipeline.deduplication import cluster_events, deduplicate_articles
 from news_pipeline.integration import archive_analyzed_result
 from news_pipeline.models import CompanyTarget, NormalizedEvent
-from news_pipeline.normalization import classify_scope, gdelt_company_relevance
+from news_pipeline.normalization import (
+    classify_scope,
+    company_news_relevance,
+    context_relevance_metadata,
+    gdelt_company_relevance,
+)
 from news_pipeline.point_in_time import events_as_of, point_in_time_status
 from news_pipeline.sources.current_news import GoogleNewsRssClient, NaverNewsClient
 from news_pipeline.sources.dart import OpenDartClient
@@ -250,6 +255,39 @@ def test_company_legal_alias_is_accepted_without_ticker_matching() -> None:
         aliases=("Samsung Electronics",),
     )
     assert samsung["accepted"] is True
+
+
+@pytest.mark.parametrize(
+    ("title", "company_name", "symbol"),
+    [
+        ("Easy apple pie recipes for fall", "Apple Inc.", "AAPL"),
+        ("삼성생명, 신상품 출시", "삼성전자", "005930"),
+    ],
+)
+def test_current_news_gate_rejects_generic_name_and_affiliate_false_positives(
+    title: str, company_name: str, symbol: str
+) -> None:
+    result = company_news_relevance(
+        title,
+        company_name=company_name,
+        symbol=symbol,
+    )
+
+    assert result["accepted"] is False
+    assert result["scope"] != "COMPANY"
+
+
+def test_distant_local_global_event_records_low_market_relevance() -> None:
+    metadata = context_relevance_metadata(
+        "Nepal flood forces local road closures",
+        target_market="US",
+        target_sector="Semiconductor",
+        company_name="NVIDIA CORP",
+    )
+
+    assert metadata["target_market_relevance"] == "LOW"
+    assert metadata["target_sector_relevance"] == "LOW"
+    assert metadata["target_company_relevance"] == "LOW"
 
 
 def test_same_numbered_supply_event_clusters_but_distinct_amounts_stay_separate() -> None:

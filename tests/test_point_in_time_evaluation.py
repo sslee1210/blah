@@ -173,6 +173,19 @@ def test_empty_inputs_are_reported_not_evaluable_without_fake_metrics() -> None:
     }
 
 
+def test_short_market_proxies_do_not_abort_evaluation() -> None:
+    short = _frame(20)
+    bundle = evaluate_point_in_time(
+        {},
+        config=BacktestConfig(market="KR"),
+        market_proxies={"KOSPI": short, "KOSDAQ": short},
+    )
+
+    assert bundle.metadata["status"] == "not_evaluable"
+    assert bundle.metadata["trusted_baseline_available"] is False
+    assert len(bundle.metadata["errors"]) >= 2
+
+
 def test_aggregate_performance_calculates_requested_metrics() -> None:
     frame = pd.DataFrame(
         {

@@ -10,11 +10,13 @@ from core.credentials import KiwoomCredentials
 from core.kiwoom_rest import (
     KiwoomRestClient,
     KiwoomRestError,
+    OhlcQualityError,
     StockInfo,
     _daily_frame,
     _minute_frame,
     completed_daily_bars,
     latest_completed_us_weekday,
+    normalize_kiwoom_us_symbol,
     number,
     completed_us_minute_bars,
     regular_session_minute_bars,
@@ -47,6 +49,55 @@ def test_malformed_us_bars_are_not_silently_removed(parser, problem) -> None:
         bad["high_pric"] = "1"
     with pytest.raises(KiwoomRestError, match="OHLCV"):
         parser([row, bad])
+
+
+@pytest.mark.parametrize(
+    ("input_symbol", "expected"),
+    [
+        ("BRK.B", "BRKB"),
+        ("BRK-B", "BRKB"),
+        ("BRK/B", "BRKB"),
+        ("brkb", "BRKB"),
+        ("BRK.A", "BRKA"),
+        ("AAPL", "AAPL"),
+    ],
+)
+def test_kiwoom_class_share_symbol_normalization_is_explicit(
+    input_symbol: str, expected: str
+) -> None:
+    assert normalize_kiwoom_us_symbol(input_symbol) == expected
+
+
+def test_large_ohlc_range_violation_is_classified_but_still_blocked() -> None:
+    row = {
+        "dt": "20260908",
+        "open_pric": "100",
+        "high_pric": "110",
+        "low_pric": "90",
+        "cur_prc": "180",
+        "acc_trde_qty": "100",
+    }
+
+    with pytest.raises(OhlcQualityError) as exc_info:
+        _daily_frame([row])
+
+    assert exc_info.value.category == "B:CORPORATE_ACTION_SUSPECTED"
+
+
+def test_small_ohlc_range_violation_remains_malformed_and_blocked() -> None:
+    row = {
+        "dt": "20260908",
+        "open_pric": "100",
+        "high_pric": "110",
+        "low_pric": "90",
+        "cur_prc": "112",
+        "acc_trde_qty": "100",
+    }
+
+    with pytest.raises(OhlcQualityError) as exc_info:
+        _daily_frame([row])
+
+    assert exc_info.value.category == "C:MALFORMED_OHLC"
 
 
 def test_daily_response_is_sorted_and_deduplicated() -> None:

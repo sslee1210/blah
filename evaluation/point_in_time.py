@@ -139,10 +139,17 @@ def evaluate_point_in_time(
     snapshot may use ``*`` as the symbol.  No live news request is made here.
     """
 
-    proxies = {
-        key.upper(): _validated_frame(price_views(value)[0], config.market)
-        for key, value in (market_proxies or {}).items()
-    }
+    errors: list[dict[str, str]] = []
+    proxies: dict[str, pd.DataFrame] = {}
+    for key, value in (market_proxies or {}).items():
+        try:
+            proxies[key.upper()] = _validated_frame(price_views(value)[0], config.market)
+        except Exception as exc:
+            # A short pilot dataset can legitimately contain fewer than the
+            # indicator warm-up bars for its market proxy.  Treat that proxy as
+            # unavailable and let the trust/data-requirement gates report the
+            # run as not evaluable instead of aborting the entire evaluation.
+            errors.append({"symbol": f"proxy:{key}", "error": str(exc)})
     intelligence = intelligence_snapshots or {}
     universe = {
         str(day): {symbol.upper() for symbol in symbols}
@@ -150,7 +157,6 @@ def evaluate_point_in_time(
     }
     signal_rows: list[dict[str, object]] = []
     outcome_rows: list[dict[str, object]] = []
-    errors: list[dict[str, str]] = []
     proxy_cache: dict[pd.Timestamp, tuple[str, bool]] = {}
 
     for key, (stock, raw_frame) in stocks.items():

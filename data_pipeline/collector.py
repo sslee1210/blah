@@ -39,12 +39,14 @@ class ResumableCollector:
         max_attempts: int = 3,
         retry_seconds: float = 1.0,
         request_interval_seconds: float = 0.0,
+        checkpoint_every: int = 1,
     ) -> None:
         self.store = store
         self.provider = provider
         self.max_attempts = max(1, max_attempts)
         self.retry_seconds = max(0.0, retry_seconds)
         self.request_interval_seconds = max(0.0, request_interval_seconds)
+        self.checkpoint_every = max(1, int(checkpoint_every))
 
     def collect(
         self,
@@ -164,10 +166,14 @@ class ResumableCollector:
                 "raw_path": manifest.raw_path,
             }
             checkpoint["failed"].pop(request.key, None)
-            self.store.save_checkpoint(checkpoint)
+            if number % self.checkpoint_every == 0 or number == total:
+                self.store.save_checkpoint(checkpoint)
             if self.request_interval_seconds and number < total:
                 time.sleep(self.request_interval_seconds)
 
+        # A run can end on skipped items, so persist once more even when the
+        # last processed request did not hit the batching boundary.
+        self.store.save_checkpoint(checkpoint)
         quality_json, _ = self.store.write_quality_reports(reports)
         stock_assets = [item for item in assets if item.kind == "stock"]
         safe = (
